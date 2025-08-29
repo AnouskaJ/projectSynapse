@@ -1,0 +1,18 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body, #root { height: 100%; }
+}
+
+@layer components {
+  .btn { @apply inline-flex items-center justify-center px-3 py-2 rounded-xl text-sm font-medium transition; }
+  .btn-primary { @apply bg-grab text-black hover:brightness-110 shadow-grab; }
+  .btn-ghost { @apply bg-transparent text-gray-200 border border-grab-edge hover:bg-grab-edge/40; }
+  .btn-danger { @apply bg-rose-600 text-white hover:bg-rose-700; }
+
+  .card { @apply rounded-2xl p-5 border border-grab-edge bg-grab-card/60 backdrop-blur; }
+
+  .kbd { @apply rounded border border-grab-edge px-1.5 py-0.5 text-xs text-gray-300 bg-grab-card; }
+}
