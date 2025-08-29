@@ -1,0 +1,17 @@
+# Ignore config files with secrets
+synapseFlask/config.json
+
+# Optional: also ignore service account JSONs
+*.json
+!package.json   # keep Node's package.json if needed
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Virtual environment
+venv/
+.env/
