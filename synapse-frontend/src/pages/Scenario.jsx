@@ -6,43 +6,32 @@ import AgentStream from "../components/AgentStream.jsx";
 const DEFAULTS = {
   grabfood: {
     title: "GrabFood",
-    scenario: "Restaurant overloaded: kitchen prep time exceeds 40 minutes. Customer waiting.",
-    origin_place: "Popular hawker centre, Singapore",
-    dest_place: "CapitaSpring, Singapore"
+    scenario: "Restaurant overloaded: kitchen prep time exceeds 40 minutes. Customer waiting."
   },
   grabmart: {
     title: "GrabMart",
-    scenario: "Mart inventory shortage: ordered items out of stock. Suggest substitutions and nearest alternatives.",
-    origin_place: "Giant Supermarket, Singapore",
-    dest_place: "Marina One, Singapore"
+    scenario: "Mart inventory shortage: ordered items out of stock. Suggest substitutions and nearest alternatives."
   },
   grabexpress: {
     title: "GrabExpress",
-    scenario: "Road closure due to parade. Parcel must be rerouted, driver stuck.",
-    origin_place: "Kallang Wave Mall",
-    dest_place: "Raffles Place"
+    scenario: "Road closure due to parade. Parcel must be rerouted, driver stuck."
   },
   grabcar: {
     title: "GrabCar",
-    scenario: "Traffic jam en route to airport caused by accident. Need fastest alternate route.",
-    origin_place: "Marina Bay Sands",
-    dest_place: "Changi Airport"
+    scenario: "Traffic jam en route to airport caused by accident. Need fastest alternate route."
   },
   custom: {
     title: "Custom",
-    scenario: "",
-    origin_place: "",
-    dest_place: ""
+    scenario: ""
   }
 };
 
 export default function Scenario({ isCustom = false }) {
   const { service } = useParams();
   const key = isCustom ? "custom" : (service || "grabcar").toLowerCase();
-
   const defaults = DEFAULTS[key] ?? DEFAULTS.custom;
 
-  const [runParams, setRunParams] = useState(null);
+  const [scenarioText, setScenarioText] = useState("");
 
   const headline = useMemo(() => defaults.title || "Scenario", [defaults.title]);
 
@@ -55,12 +44,10 @@ export default function Scenario({ isCustom = false }) {
 
       <ScenarioForm
         defaultScenario={defaults.scenario}
-        defaultOriginPlace={defaults.origin_place}
-        defaultDestPlace={defaults.dest_place}
-        onRun={(rp) => setRunParams(rp)}
+        onRun={(text) => setScenarioText(text)}
       />
 
-      <AgentStream runParams={runParams} />
+      <AgentStream scenarioText={scenarioText} />
     </div>
   );
 }

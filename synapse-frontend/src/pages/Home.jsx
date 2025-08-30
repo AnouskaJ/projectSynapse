@@ -18,7 +18,7 @@ export default function Home() {
 
       <section className="grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
         {services.map((s) => (
-          <Link key={s.key} to={`/service/${s.key}`} className="card hover:shadow-grab transition">
+          <Link key={s.key} to={`/service/${s.key}`} className="card hover:brightness-110 transition p-4">
             <div className="text-lg font-semibold" style={{ color: "#00B14F" }}>{s.name}</div>
             <p className="text-sm text-gray-300 mt-1">{s.desc}</p>
             <div className="mt-4">

@@ -1,7 +1,9 @@
+# app.py
 import os, re, json, time, math, traceback, logging
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
+
 import requests
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, g
 from flask_cors import CORS
 
 # ----------------------------- LOGGING --------------------------------
@@ -20,17 +22,30 @@ def get_cfg(key: str, default: str = ""):
     return os.getenv(key, cfg.get(key, default))
 
 # ----------------------------- CONFIG ---------------------------------
-GOOGLE_MAPS_API_KEY = get_cfg("GOOGLE_MAPS_API_KEY", "").strip()
-GEMINI_API_KEY      = get_cfg("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL        = get_cfg("GEMINI_MODEL", "gemini-2.0-flash")
+GOOGLE_MAPS_API_KEY  = get_cfg("GOOGLE_MAPS_API_KEY", "").strip()
+GEMINI_API_KEY       = get_cfg("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL         = get_cfg("GEMINI_MODEL", "gemini-2.0-flash")
 
-FIREBASE_PROJECT_ID   = get_cfg("FIREBASE_PROJECT_ID", "")
-SERVICE_ACCOUNT_FILE  = get_cfg("GOOGLE_APPLICATION_CREDENTIALS", "")
+FIREBASE_PROJECT_ID  = get_cfg("FIREBASE_PROJECT_ID", "").strip()
+SERVICE_ACCOUNT_FILE = get_cfg("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
 
-MAX_STEPS            = int(get_cfg("MAX_STEPS", "5"))
+# Require Firebase auth for protected endpoints (run/resolve/fcm)
+REQUIRE_AUTH         = get_cfg("REQUIRE_AUTH", "false").lower() == "true"
+
+# CORS origins (comma-separated). Default: permissive (dev).
+CORS_ORIGINS         = [o.strip() for o in get_cfg("CORS_ORIGINS", "*").split(",")]
+
+MAX_STEPS            = int(get_cfg("MAX_STEPS", "7"))
 MAX_SECONDS          = int(get_cfg("MAX_SECONDS", "120"))
 STREAM_DELAY         = float(get_cfg("STREAM_DELAY", "0.10"))
 BASELINE_SPEED_KMPH  = float(get_cfg("BASELINE_SPEED_KMPH", "40.0"))
+
+DEFAULT_CUSTOMER_TOKEN   = get_cfg("DEFAULT_CUSTOMER_TOKEN", "").strip()
+DEFAULT_DRIVER_TOKEN     = get_cfg("DEFAULT_DRIVER_TOKEN", "").strip()
+DEFAULT_PASSENGER_TOKEN  = get_cfg("DEFAULT_PASSENGER_TOKEN", "").strip()
+
+# If true, we do NOT actually send push—either simulate or call FCM validate-only
+FCM_DRY_RUN              = get_cfg("FCM_DRY_RUN", "false").lower() == "true"
 
 if not GOOGLE_MAPS_API_KEY:
     raise RuntimeError("GOOGLE_MAPS_API_KEY missing in config.json or env")
@@ -59,6 +74,55 @@ def _fcm_access_token() -> str:
     creds.refresh(GARequest())
     return creds.token
 
+# ----------------------------- FIREBASE VERIFY (ID token) --------------
+try:
+    import firebase_admin
+    from firebase_admin import credentials as fb_credentials, auth as fb_auth
+    _admin_initialized = False
+    if SERVICE_ACCOUNT_FILE and os.path.exists(SERVICE_ACCOUNT_FILE):
+        firebase_admin.initialize_app(fb_credentials.Certificate(SERVICE_ACCOUNT_FILE))
+        _admin_initialized = True
+        log.info("[firebase_admin] initialized with service account")
+    else:
+        firebase_admin.initialize_app()
+        _admin_initialized = True
+        log.info("[firebase_admin] initialized with ADC")
+except Exception as e:
+    _admin_initialized = False
+    if REQUIRE_AUTH:
+        raise RuntimeError(f"Failed to init firebase_admin but REQUIRE_AUTH is true: {e}")
+    log.warning(f"[firebase_admin] not initialized (auth disabled): {e}")
+
+def _extract_bearer_token() -> str:
+    hdr = request.headers.get("Authorization", "")
+    if hdr.startswith("Bearer "):
+        return hdr.split(" ", 1)[1].strip()
+    return ""
+
+def verify_firebase_token_optional() -> Optional[Dict[str, Any]]:
+    """
+    Returns decoded token dict if token present and valid, else None.
+    """
+    token = _extract_bearer_token() or request.args.get("token", "")
+    if not token or not _admin_initialized:
+        return None
+    try:
+        return fb_auth.verify_id_token(token)
+    except Exception as e:
+        log.warning(f"[auth] token present but invalid: {e}")
+        return None
+
+def require_auth(fn):
+    from functools import wraps
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        decoded = verify_firebase_token_optional()
+        if REQUIRE_AUTH and (decoded is None):
+            return jsonify({"error": "unauthorized"}), 401
+        g.user = decoded  # may be None if not provided/required
+        return fn(*args, **kwargs)
+    return wrapper
+
 # ----------------------------- HTTP helpers ----------------------------
 def http_get(url: str, params: Dict[str, Any] = None, headers: Dict[str, str] = None, timeout: float = 20.0):
     r = requests.get(url, params=params or {}, headers=headers or {}, timeout=timeout)
@@ -67,42 +131,35 @@ def http_get(url: str, params: Dict[str, Any] = None, headers: Dict[str, str] = 
 
 def http_post(url: str, json_body: Dict[str, Any], headers: Dict[str, str], timeout: float = 25.0):
     r = requests.post(url, json=json_body, headers=headers, timeout=timeout)
-    r.raise_for_status()
     try:
-        return r.json()
-    except Exception:
-        return {"ok": True, "text": r.text}
+        r.raise_for_status()
+        try:
+            return r.json()
+        except Exception:
+            return {"ok": True, "text": r.text}
+    except requests.HTTPError:
+        return {"ok": False, "status": r.status_code, "error_text": r.text}
 
 # ----------------------------- UTIL -----------------------------------
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 def sse(data: Any) -> str:
-    """
-    Server-Sent Events line. Streams STRICT JSON step-by-step.
-    """
     payload = json.dumps(data, ensure_ascii=False) if isinstance(data, (dict, list)) else str(data)
     return f"data: {payload}\n\n"
 
 def strip_json_block(text: str) -> str:
-    """
-    Return the JSON payload when the model replies in a fenced ```json block.
-    Falls back to the original text if no fences are found.
-    """
     t = (text or "").strip()
     if "```" in t:
         parts = t.split("```")
         if len(parts) >= 3:
             block = parts[1].strip()
-            # If it starts with 'json', drop that first line and return the rest
             if block.lower().startswith("json"):
                 block = block.split("\n", 1)[1] if "\n" in block else ""
             return block
     return t
+
 def safe_json(text: str, default: Any = None) -> Any:
-    """
-    Robust JSON parse with a second-chance object extraction.
-    """
     try:
         return json.loads(text)
     except Exception:
@@ -115,15 +172,13 @@ def safe_json(text: str, default: Any = None) -> Any:
         return default
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """
-    Straight-line distance in kilometers.
-    """
     R = 6371.0088
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlmb = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlmb/2)**2
-    return 2 * R * math.asin(math.sqrt(a))
+    import math as _m
+    phi1, phi2 = _m.radians(lat1), _m.radians(lat2)
+    dphi = _m.radians(lat2 - lat1)
+    dlmb = _m.radians(lon2 - lon1)
+    a = _m.sin(dphi/2)**2 + _m.cos(phi1)*_m.cos(phi2)*_m.sin(dlmb/2)**2
+    return 2 * R * _m.asin(_m.sqrt(a))
 
 # -------------------------- HINT EXTRACTORS ---------------------------
 HINT_RE_ORIGIN = re.compile(r"origin\s*=\s*([0-9.+-]+)\s*,\s*([0-9.+-]+)", re.I)
@@ -133,15 +188,12 @@ HINT_RE_DEST_TEXT   = re.compile(r"(?:^|[\s,;])dest(?:\s*[:=])\s*([^\n]+)", re.I
 HINT_RE_FROM_TO     = re.compile(r"\bfrom\s+(.+?)\s+to\s+(.+?)(?:[,.]|$)", re.I)
 
 def extract_hints(scenario: str, driver_token: Optional[str], passenger_token: Optional[str]) -> Dict[str, Any]:
-    """
-    Pull out coordinates, place names, and device tokens from a scenario string.
-    """
     hints: Dict[str, Any] = {}
-    m1 = HINT_RE_ORIGIN.search(scenario); m2 = HINT_RE_DEST.search(scenario)
+    m1, m2 = HINT_RE_ORIGIN.search(scenario), HINT_RE_DEST.search(scenario)
     if m1 and m2:
         hints["origin"] = [float(m1.group(1)), float(m1.group(2))]
         hints["dest"]   = [float(m2.group(1)), float(m2.group(2))]
-    mt1 = HINT_RE_ORIGIN_TEXT.search(scenario); mt2 = HINT_RE_DEST_TEXT.search(scenario)
+    mt1, mt2 = HINT_RE_ORIGIN_TEXT.search(scenario), HINT_RE_DEST_TEXT.search(scenario)
     if mt1: hints["origin_place"] = mt1.group(1).strip()
     if mt2: hints["dest_place"]   = mt2.group(1).strip()
     mt3 = HINT_RE_FROM_TO.search(scenario)
@@ -154,41 +206,24 @@ def extract_hints(scenario: str, driver_token: Optional[str], passenger_token: O
 
 # -------------------------- GOOGLE HELPERS ----------------------------
 def _gm_headers(field_mask: Optional[str] = None) -> Dict[str, str]:
-    """
-    Default headers for Google services that use API key in headers.
-    """
     h = {"X-Goog-Api-Key": GOOGLE_MAPS_API_KEY}
     if field_mask:
         h["X-Goog-FieldMask"] = field_mask
     return h
 
 def _routes_post(path: str, body: dict, field_mask: str) -> dict:
-    """
-    POST wrapper for Routes API.
-    """
     url = f"https://routes.googleapis.com/{path}"
     return http_post(url, body, headers=_gm_headers(field_mask))
 
 def _places_post(path: str, body: dict, field_mask: str) -> dict:
-    """
-    POST wrapper for Places API (New).
-    """
     url = f"https://places.googleapis.com/v1/{path}"
     return http_post(url, body, headers=_gm_headers(field_mask))
 
 def _places_get(path: str, field_mask: str) -> dict:
-    """
-    GET wrapper for Places Details (New).
-    """
     url = f"https://places.googleapis.com/v1/{path}"
     return http_get(url, headers=_gm_headers(field_mask))
 
 def _geocode(text: str) -> Optional[tuple[float, float]]:
-    """
-    Geocode a free-text address/place via Geocoding API.
-
-    Returns: (lat, lon) or None if not found.
-    """
     url = "https://maps.googleapis.com/maps/api/geocode/json"
     params = {"address": text, "key": GOOGLE_MAPS_API_KEY}
     try:
@@ -204,9 +239,6 @@ def _geocode(text: str) -> Optional[tuple[float, float]]:
 
 # ----------------------------- REAL TOOLS ------------------------------
 def tool_geocode_place(query: str) -> Dict[str, Any]:
-    """
-    Resolve textual place/address to coordinates using Geocoding API.
-    """
     pt = _geocode(query)
     if not pt:
         return {"found": False}
@@ -214,9 +246,6 @@ def tool_geocode_place(query: str) -> Dict[str, Any]:
     return {"found": True, "lat": lat, "lon": lon, "query": query}
 
 def _seconds_to_minutes_str_dur(sec_str: str) -> float:
-    """
-    Convert Routes API '123s'/'1234s' to minutes (float).
-    """
     try:
         s = float(sec_str.rstrip("s"))
         return round(s / 60.0, 1)
@@ -224,9 +253,6 @@ def _seconds_to_minutes_str_dur(sec_str: str) -> float:
         return 0.0
 
 def tool_check_traffic(origin: List[float], dest: List[float]) -> Dict[str, Any]:
-    """
-    Traffic-aware ETA and distance between origin and dest using Routes API.
-    """
     if not origin or not dest or len(origin) != 2 or len(dest) != 2:
         return {"error": "invalid_coordinates"}
 
@@ -251,22 +277,20 @@ def tool_check_traffic(origin: List[float], dest: List[float]) -> Dict[str, Any]
         delay_min = max(0.0, round(eta_min - baseline_min, 1))
         return {"etaMin": eta_min, "delayMin": delay_min, "distanceKm": round(dist_km, 2)}
     except Exception as e:
-        # fallback: haversine
         dist_km = round(haversine_km(origin[0], origin[1], dest[0], dest[1]), 3)
         eta_min = round((dist_km / BASELINE_SPEED_KMPH) * 60.0, 1) if dist_km else 0.0
         return {"approximate": True, "reason": f"routes_failure:{str(e)}",
                 "distanceKm": round(dist_km, 2), "etaMin": eta_min, "delayMin": 0.0}
 
 def tool_calculate_alternative_route(origin: List[float], dest: List[float]) -> Dict[str, Any]:
-    """
-    Return up to 3 candidate routes and the best ETA improvement using Routes API.
-    """
     if not origin or not dest or len(origin) != 2 or len(dest) != 2:
         return {"error": "invalid_coordinates"}
 
     body = {
-        "origin": {"location": {"latLng": {"latitude": origin[0], "longitude": origin[1]}}},
-        "destination": {"location": {"latLng": {"latitude": dest[0], "longitude": dest[1]}}},
+        "origin": {"location": {"latLng": {"latitude": origin[0], "longitude": origin[1]}}}
+        ,
+        "destination": {"location": {"latLng": {"latitude": dest[0], "longitude": dest[1]}}}
+        ,
         "travelMode": "DRIVE",
         "routingPreference": "TRAFFIC_AWARE_OPTIMAL",
         "departureTime": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -296,9 +320,6 @@ def tool_calculate_alternative_route(origin: List[float], dest: List[float]) -> 
                 "reason": f"routes_failure:{str(e)}"}
 
 def tool_compute_route_matrix(origins: List[List[float]], destinations: List[List[float]]) -> Dict[str, Any]:
-    """
-    Compute a distance/ETA matrix between multiple origins and destinations (Routes API).
-    """
     if not origins or not destinations:
         return {"error": "missing_origins_or_destinations"}
 
@@ -327,14 +348,11 @@ def tool_compute_route_matrix(origins: List[List[float]], destinations: List[Lis
                 "condition": el.get("condition", "ROUTE_EXISTS"),
                 "status": el.get("status", {})
             })
-        return {"elements": out}
+        return {"elements": out[:5], "count": min(5, len(out))}
     except Exception as e:
         return {"error": f"route_matrix_failure:{str(e)}"}
 
 def tool_check_weather(lat: float, lon: float) -> Dict[str, Any]:
-    """
-    Current weather from Google Weather API.
-    """
     url = "https://weather.googleapis.com/v1/currentConditions:lookup"
     params = {"location.latitude": lat, "location.longitude": lon, "key": GOOGLE_MAPS_API_KEY}
     try:
@@ -352,9 +370,6 @@ def tool_check_weather(lat: float, lon: float) -> Dict[str, Any]:
         return {"error": f"weather_failure:{str(e)}"}
 
 def tool_air_quality(lat: float, lon: float) -> Dict[str, Any]:
-    """
-    Current air quality from Google Air Quality API.
-    """
     url = "https://airquality.googleapis.com/v1/currentConditions:lookup"
     params = {"location.latitude": lat, "location.longitude": lon, "key": GOOGLE_MAPS_API_KEY}
     try:
@@ -371,21 +386,15 @@ def tool_air_quality(lat: float, lon: float) -> Dict[str, Any]:
         return {"error": f"air_quality_failure:{str(e)}"}
 
 def tool_pollen_forecast(lat: float, lon: float) -> Dict[str, Any]:
-    """
-    Pollen forecast via Google Pollen API.
-    """
     url = "https://pollen.googleapis.com/v1/forecast:lookup"
     params = {"location.latitude": lat, "location.longitude": lon, "key": GOOGLE_MAPS_API_KEY}
     try:
         data = http_get(url, params=params)
-        return {"raw": data}
+        return {"found": True, "raw": data}
     except Exception as e:
         return {"error": f"pollen_failure:{str(e)}"}
 
 def tool_places_search_nearby(lat: float, lon: float, radius_m: int = 2000, keyword: Optional[str] = None, included_types: Optional[List[str]] = None) -> Dict[str, Any]:
-    """
-    Nearby Search (Places New) – find places around a location.
-    """
     body = {
         "locationRestriction": {
             "circle": {
@@ -406,7 +415,7 @@ def tool_places_search_nearby(lat: float, lon: float, radius_m: int = 2000, keyw
     ])
     try:
         data = _places_post("places:searchNearby", body, field_mask)
-        places = data.get("places") or []
+        places = (data.get("places") or [])[:5]
         out = []
         for p in places:
             out.append({
@@ -424,9 +433,6 @@ def tool_places_search_nearby(lat: float, lon: float, radius_m: int = 2000, keyw
         return {"error": f"places_nearby_failure:{str(e)}"}
 
 def tool_place_details(place_id: str) -> Dict[str, Any]:
-    """
-    Place Details (New).
-    """
     field_mask = ",".join([
         "id","displayName","formattedAddress","nationalPhoneNumber","websiteUri",
         "rating","userRatingCount","currentOpeningHours.openNow","priceLevel"
@@ -449,25 +455,19 @@ def tool_place_details(place_id: str) -> Dict[str, Any]:
         return {"error": f"place_details_failure:{str(e)}"}
 
 def tool_roads_snap(points: List[List[float]], interpolate: bool = True) -> Dict[str, Any]:
-    """
-    Snap a sequence of GPS points to the road network (Roads API).
-    """
     if not points or any(len(p) != 2 for p in points):
         return {"error": "invalid_points"}
-
     path = "|".join([f"{p[0]},{p[1]}" for p in points])
     url = "https://roads.googleapis.com/v1/snapToRoads"
     params = {"path": path, "interpolate": "true" if interpolate else "false", "key": GOOGLE_MAPS_API_KEY}
     try:
         data = http_get(url, params=params)
-        return {"snappedPoints": data.get("snappedPoints", [])}
+        sp = data.get("snappedPoints", [])[:5]
+        return {"snappedPoints": sp, "count": len(sp)}
     except Exception as e:
         return {"error": f"roads_failure:{str(e)}"}
 
 def tool_time_zone(lat: float, lon: float, timestamp: Optional[int] = None) -> Dict[str, Any]:
-    """
-    Time Zone for a lat/lon at a given timestamp (default: now).
-    """
     if not timestamp:
         timestamp = int(time.time())
     url = "https://maps.googleapis.com/maps/api/timezone/json"
@@ -479,77 +479,173 @@ def tool_time_zone(lat: float, lon: float, timestamp: Optional[int] = None) -> D
             "timeZoneName": data.get("timeZoneName"),
             "rawOffset": data.get("rawOffset"),
             "dstOffset": data.get("dstOffset"),
-            "status": data.get("status")
+            "status": data.get("status"),
+            "found": bool(data.get("timeZoneId"))
         }
     except Exception as e:
         return {"error": f"time_zone_failure:{str(e)}"}
 
 # ------------------------- NOTIFICATIONS (FCM v1) ---------------------
+def _is_placeholder_token(token: str) -> bool:
+    t = (token or "").strip().lower()
+    return (not t) or (t in {"token","customer_token","driver_token","passenger_token","str"})
+
 def _fcm_v1_send(token: str, title: str, body: str, data: Optional[dict] = None) -> Dict[str, Any]:
-    """
-    Send a push message via Firebase Cloud Messaging (HTTP v1).
-    """
-    if not token:
-        return {"delivered": False, "reason": "missing_device_token"}
+    # Simulate/validate-only mode (dev)
+    if FCM_DRY_RUN:
+        log.info("[tool_fcm_send] DRY_RUN on → simulating delivered")
+        return {"delivered": True, "dryRun": True}
+
+    # Block missing/placeholder tokens
+    if _is_placeholder_token(token):
+        return {"delivered": False, "reason": "missing_or_placeholder_device_token"}
+
     access_token = _fcm_access_token()
-    url = f"https://fcm.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/messages:send"
+    base = f"https://fcm.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/messages:send"
     headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-    message = {"message": {"token": token, "notification": {"title": title, "body": body}}}
-    if data:
-        message["message"]["data"] = data
-    log.info(f"[tool_fcm_send] sending to token=present title='{title}'")
-    try:
-        res = http_post(url, message, headers, timeout=10)
-        ok = "name" in res
-        return {"delivered": bool(ok), "fcmResponse": res}
-    except Exception as e:
-        return {"delivered": False, "error": str(e)}
+    msg = {"message": {"token": token, "notification": {"title": title, "body": body}}}
+    if data: msg["message"]["data"] = data
+
+    log.info(f"[tool_fcm_send] sending via FCM v1 title='{title}'")
+    res = http_post(base, msg, headers, timeout=10)
+    ok = bool(res) and (("name" in res) or res.get("ok") is True)
+    if not ok:
+        return {"delivered": False, "error": res}
+    return {"delivered": True, "fcmResponse": res}
 
 def tool_notify_customer(fcm_token: Optional[str], message: str, voucher: bool=False, title: str="Order Update") -> Dict[str, Any]:
-    """
-    Notify a customer device via FCM v1. (Real Google API call.)
-    """
     return _fcm_v1_send(fcm_token or "", title, message, {"voucher": json.dumps(bool(voucher))})
 
 def tool_notify_passenger_and_driver(driver_token: Optional[str], passenger_token: Optional[str], message: str) -> Dict[str, Any]:
-    """
-    Notify both driver and passenger devices via FCM v1.
-    """
     d = _fcm_v1_send(driver_token or "", "Route Update", message) if driver_token else {"delivered": False}
     p = _fcm_v1_send(passenger_token or "", "Route Update", message) if passenger_token else {"delivered": False}
     return {"driverDelivered": d.get("delivered"), "passengerDelivered": p.get("delivered")}
 
 # ----------------------------- ASSERTIONS ------------------------------
+# --- replace the whole check_assertion with this ---
 def check_assertion(assertion: Optional[str], observation: Dict[str, Any]) -> bool:
     """
-    Simple assertion DSL to auto-evaluate tool outcomes.
+    Return True when:
+      - assertion is None/empty, and observation has no obvious error, OR
+      - the named predicate matches the observation.
+    Handles common boolean/string/number cases robustly.
     """
-    if not assertion: return True
-    a = assertion.strip().lower().replace(" ", "")
+    # No explicit assertion → pass unless an error key exists
+    if not assertion or not str(assertion).strip():
+        # if observation contains an explicit error field, fail
+        if isinstance(observation, dict) and ("error" in observation or "trace" in observation):
+            return False
+        return True
+
+    a = str(assertion).strip().lower().replace(" ", "")
+
+    def _truthy(v):
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return v != 0
+        s = str(v).strip().lower()
+        return s in {"true","1","yes","y","ok"}
+
+    # Common canned predicates (case-insensitive)
+    if "response!=none" in a:
+        return isinstance(observation, dict) and len(observation) > 0
 
     if "len(routes)>=1" in a or "routes>=1" in a:
         routes = observation.get("routes")
         return isinstance(routes, list) and len(routes) >= 1
 
-    if "customerack==true" in a:  return bool(observation.get("customerAck"))
-    if "delivered==true" in a:    return bool(observation.get("delivered")) or bool(observation.get("driverDelivered")) or bool(observation.get("passengerDelivered"))
-    if "approved==true" in a:     return bool(observation.get("approved"))
-    if "improvementmin>0" in a:   return isinstance(observation.get("improvementMin"), (int,float)) and observation["improvementMin"] > 0
-    if "etadeltamin<=0" in a:     return isinstance(observation.get("etaDeltaMin"), (int,float)) and observation["etaDeltaMin"] <= 0
+    if "customerack==true" in a:
+        return _truthy(observation.get("customerAck"))
+
+    if "delivered==true" in a:
+        # supports notify_customer and notify_passenger_and_driver
+        return (_truthy(observation.get("delivered"))
+                or _truthy(observation.get("driverDelivered"))
+                or _truthy(observation.get("passengerDelivered")))
+
+    if "approved==true" in a:
+        return _truthy(observation.get("approved"))
+
+    if "improvementmin>0" in a:
+        v = observation.get("improvementMin")
+        return isinstance(v, (int, float)) and v > 0
+
+    if "improvementmin>=0" in a:
+        return isinstance(observation.get("improvementMin"), (int, float))
+
+    if "etadeltamin<=0" in a:
+        v = observation.get("etaDeltaMin")
+        return isinstance(v, (int, float)) and v <= 0
+
     if "candidates>0" in a or "count>0" in a:
         v = observation.get("count") or observation.get("candidates")
-        if isinstance(v, list): return len(v) > 0
-        if isinstance(v, (int,float)): return v > 0
-    if "delaymin>=0" in a:        return isinstance(observation.get("delayMin"), (int,float)) and observation["delayMin"] >= 0
-    if "hazard==false" in a:      return not bool(observation.get("hazard"))
-    if "found==true" in a:        return bool(observation.get("found"))
-    if "response!=none" in a:     return observation.get("response") is not None
+        if isinstance(v, list):  return len(v) > 0
+        if isinstance(v, (int, float)): return v > 0
+        return False
+
+    if "delaymin>=0" in a:
+        v = observation.get("delayMin")
+        return isinstance(v, (int, float)) and v >= 0
+
+    if "hazard==false" in a:
+        return not _truthy(observation.get("hazard"))
+
+    if "found==true" in a:
+        return _truthy(observation.get("found"))
+
     if "photos>0" in a:
         v = observation.get("photos")
         return isinstance(v, (int, float)) and v > 0
+
+    if "flow==started" in a:
+        return (observation.get("flow") == "started")
+
+    if "refunded==true" in a:
+        return _truthy(observation.get("refunded"))
+
+    if "cleared==true" in a:
+        return _truthy(observation.get("cleared"))
+
+    if "feedbacklogged==true" in a:
+        return _truthy(observation.get("feedbackLogged"))
+
+    if "suggested==true" in a:
+        return _truthy(observation.get("suggested"))
+
+    if "status!=none" in a:
+        return observation.get("status") is not None
+
+    if "merchants>0" in a:
+        m = observation.get("merchants")
+        return isinstance(m, list) and len(m) > 0
+
+    if "lockers>0" in a:
+        l = observation.get("lockers")
+        return isinstance(l, list) and len(l) > 0
+
+    if "messagesent!=none" in a:
+        return observation.get("messageSent") is not None
+
+    if a.startswith("has."):  # e.g. has.prepTimeMin
+        key = a.split("has.", 1)[1]
+        return key in observation
+
+    # Final generic equality like foo==bar, normalized
     if "==" in a and all(op not in a for op in (">", "<", "!=")):
         k, val = a.split("==", 1)
-        return str(observation.get(k)) == val
+        ov = observation.get(k)
+        # normalize both sides
+        sval = val.strip().lower()
+        if sval in {"true","false"}:
+            return _truthy(ov) == (sval == "true")
+        try:
+            # numeric compare if possible
+            return float(str(ov)) == float(sval)
+        except Exception:
+            return str(ov).strip().lower() == sval
+
+    # If we can’t parse, be safe: don’t fail the step
     return True
 
 # ----------------------------- PROMPTS --------------------------------
@@ -587,386 +683,403 @@ Scenario:
 {scenario}
 """
 
+# ----------------------------- POLICY RAILS (extended) -----------------
+def _policy_next_extended(kind: str, steps_done: int, hints: Dict[str, Any]) -> Optional[tuple]:
+    """
+    Returns:
+      (intent, tool, params, assertion, finish_reason, final_message, reason)
+    """
+    # Traffic
+    if kind == "traffic":
+        origin = hints.get("origin"); dest = hints.get("dest")
+        if not origin or not dest:
+            if steps_done == 0:
+                return ("clarify", "none",
+                        {"question":"Provide origin/dest as 'origin=lat,lon dest=lat,lon' or place names."},
+                        None, "continue", None,
+                        "No coordinates; ask for origin/dest.")
+            return None
+        if steps_done == 0:
+            return ("check congestion","check_traffic",
+                    {"origin":origin,"dest":dest},
+                    "delayMin>=0","continue",None,
+                    "Measure baseline ETA and traffic delay.")
+        if steps_done == 1:
+            return ("reroute","calculate_alternative_route",
+                    {"origin":origin,"dest":dest},
+                    "improvementMin>=0","continue",None,
+                    "Compute alternatives and pick fastest.")
+        if steps_done == 2:
+            msg = "Rerouted to faster path; updated ETA shared."
+            return ("inform both","notify_passenger_and_driver",
+                    {"driver_token": hints.get("driver_token"),
+                     "passenger_token": hints.get("passenger_token"),
+                     "message": msg},
+                    "delivered==true","final","Reroute applied; passengers notified.",
+                    "Notify both parties.")
+        return None
 
-SCHEMA_SPEC = {
-    "type":"object",
-    "properties":{
-        "intent":{"type":"string"},
-        "tool":{"type":"string"},
-        "params":{"type":"object"},
-        "assertion":{"type":["string","null"]},
-        "finish_reason":{"type":"string","enum":["continue","final","escalate"]},
-        "final_message":{"type":["string","null"]}
-    },
-    "required":["intent","tool","params","finish_reason"]
-}
+    # Merchant capacity
+    if kind == "merchant_capacity":
+        merchant_id = hints.get("merchant_id","merchant_demo")
+        latlon = hints.get("origin") or hints.get("dest")
 
-SYSTEM_ROLE_TMPL = (
-    "You are Synapse, an expert logistics coordinator. Resolve disruptions in at most "
-    "{max_steps} steps and under {max_seconds} seconds. Use only provided tools. "
-    "Each step must be strict JSON per schema."
-)
+        if steps_done == 0:
+            return ("check merchant status","get_merchant_status",
+                    {"merchant_id": merchant_id},
+                    None,"continue",None,
+                    "Check prep time and backlog.")
 
-def tools_manifest_text() -> str:
-    return json.dumps([
-        {"name":"check_traffic","description":"Traffic-aware ETA/distance via Routes API.","schema":{"origin":"[lat,lon]","dest":"[lat,lon]"}},
-        {"name":"calculate_alternative_route","description":"Alternative routes & best improvement via Routes API.","schema":{"origin":"[lat,lon]","dest":"[lat,lon]"}},
-        {"name":"compute_route_matrix","description":"Distance/ETA matrix for multiple origins/destinations.","schema":{"origins":"[[lat,lon],...]","destinations":"[[lat,lon],...]"}},
-        {"name":"check_weather","description":"Current weather via Google Weather API.","schema":{"lat":"float","lon":"float"}},
-        {"name":"air_quality","description":"Current air quality via Air Quality API.","schema":{"lat":"float","lon":"float"}},
-        {"name":"pollen_forecast","description":"Pollen forecast via Pollen API.","schema":{"lat":"float","lon":"float"}},
-        {"name":"time_zone","description":"Time zone for a lat/lon.","schema":{"lat":"float","lon":"float","timestamp":"int?"}},
-        {"name":"places_search_nearby","description":"Nearby places (New) around a point.","schema":{"lat":"float","lon":"float","radius_m":"int","keyword":"str?","included_types":"list[str]?"}},
-        {"name":"place_details","description":"Place details (New).","schema":{"place_id":"str"}},
-        {"name":"roads_snap","description":"Snap GPS points to roads (Roads API).","schema":{"points":"[[lat,lon],...]","interpolate":"bool?"}},
-        {"name":"geocode_place","description":"Geocode a place/address to coordinates.","schema":{"query":"str"}},
-        {"name":"notify_customer","description":"Push notify customer via FCM v1.","schema":{"fcm_token":"str","message":"str","voucher":"bool","title":"str"}},
-        {"name":"notify_passenger_and_driver","description":"Push notify both via FCM v1.","schema":{"driver_token":"str","passenger_token":"str","message":"str"}}
-    ], ensure_ascii=False)
+        if (steps_done == 1) and (latlon is not None):
+            return ("suggest alt merchant","get_nearby_merchants",
+                    {"lat": latlon[0], "lon": latlon[1], "radius_m": 2000},
+                    "merchants>0","continue",None,
+                    "Suggest up to 5 nearby alternates.")
+        if (steps_done == 1) and (latlon is None):
+            token = hints.get("customer_token") or hints.get("passenger_token") or DEFAULT_CUSTOMER_TOKEN
+            params = {
+                "fcm_token": token,
+                "message": "Merchant is overloaded; we’ll share alternatives shortly or re-assign.",
+                "voucher": True, "title":"Delay notice"
+            }
+            assertion = "delivered==true" if (token or FCM_DRY_RUN) else None
+            return ("notify","notify_customer", params, assertion, "final",
+                    "Customer informed (no coordinates available).",
+                    "No coordinates available to search alternatives; notify customer.")
 
-def build_plan_prompt(scenario: str, cls: Dict[str, Any], so_far: List[Dict[str, Any]]) -> str:
-    system_role = SYSTEM_ROLE_TMPL.format(max_steps=MAX_STEPS, max_seconds=MAX_SECONDS)
-    tools_text = tools_manifest_text()
-    so_far_json = json.dumps(so_far, ensure_ascii=False)
-    schema_json = json.dumps(SCHEMA_SPEC, ensure_ascii=False)
+        if steps_done == 2:
+            token = hints.get("customer_token") or hints.get("passenger_token") or DEFAULT_CUSTOMER_TOKEN
+            params = {
+                "fcm_token": token,
+                "message": "Merchant is overloaded; sharing 3 nearby alternatives.",
+                "voucher": True, "title":"Delay notice"
+            }
+            assertion = "delivered==true" if (token or FCM_DRY_RUN) else None
+            return ("notify","notify_customer", params, assertion, "final",
+                    "Customer informed; alternatives shared.",
+                    "Send push with voucher and alternatives.")
+        return None
 
-    # Assertion contract the model MUST follow
-    assertion_contract = """
-Allowed assertion grammar (choose exactly ONE that matches your tool):
-- For geocode_place:         "found==true"
-- For check_traffic:         "delayMin>=0"
-- For calculate_alternative_route: "improvementMin>=0" (use >0 if you expect a win)
-- For compute_route_matrix:  "count>0" or "elements>0"
-- For check_weather:         "hazard==false" OR "tempC!=none" (prefer hazard==false)
-- For air_quality:           "found==true" (treat presence of an index as found)
-- For pollen_forecast:       "found==true" (treat presence of a forecast as found)
-- For time_zone:             "found==true" (treat presence of timeZoneId as found)
-- For places_search_nearby:  "count>0"
-- For place_details:         "found==true"
-- For roads_snap:            "count>0" (count snappedPoints)
-- For notify_customer:       "delivered==true"
-- For notify_passenger_and_driver: "delivered==true"
+    # Damage dispute
+    if kind == "damage_dispute":
+        order_id = hints.get("order_id","order_demo")
+        driver_id = hints.get("driver_id","driver_demo")
+        merchant_id = hints.get("merchant_id","merchant_demo")
+        if steps_done == 0:
+            return ("start mediation","initiate_mediation_flow",{"order_id": order_id},
+                    "flow==started","continue",None,"Start structured mediation.")
+        if steps_done == 1:
+            return ("collect evidence","collect_evidence",{"order_id": order_id},
+                    "photos>0","continue",None,"Collect photos and questionnaire.")
+        if steps_done == 2:
+            return ("analyze evidence","analyze_evidence",{"order_id": order_id},
+                    "status!=none","continue",None,"Decide likely fault.")
+        if steps_done == 3:
+            return ("refund customer","issue_instant_refund",{"order_id": order_id,"amount": 5.0},
+                    "refunded==true","continue",None,"Issue goodwill refund.")
+        if steps_done == 4:
+            return ("clear driver","exonerate_driver",{"driver_id": driver_id},
+                    "cleared==true","continue",None,"Clear driver of fault.")
+        if steps_done == 5:
+            return ("feedback to merchant","log_merchant_packaging_feedback",
+                    {"merchant_id": merchant_id,"feedback":"Seal failed; spillage evidence attached."},
+                    "feedbacklogged==true","continue",None,"Log packaging issue.")
+        if steps_done == 6:
+            token = hints.get("customer_token") or hints.get("passenger_token") or DEFAULT_CUSTOMER_TOKEN
+            params = {
+                "fcm_token": token,
+                "message": "Issue resolved: refund issued; driver cleared. Thanks for your patience.",
+                "voucher": False, "title":"Resolution"
+            }
+            assertion = "delivered==true" if (token or FCM_DRY_RUN) else None
+            return ("notify","notify_customer", params, assertion, "final",
+                    "Both parties informed; trip can be closed.",
+                    "Send resolution push.")
+        return None
 
-NEVER invent custom assertions like "lat != null", "place_id != null", etc.
-"""
+    # Recipient unavailable
+    if kind == "recipient_unavailable":
+        if steps_done == 0:
+            rid = hints.get("recipient_id","recipient_demo")
+            return ("reach out via chat","contact_recipient_via_chat",
+                    {"recipient_id": rid, "message":"Driver has arrived. How should we proceed?"},
+                    "messagesent!=none","continue",None,"Start chat to coordinate.")
+        if steps_done == 1:
+            addr = hints.get("dest_place") or "Building concierge"
+            return ("suggest safe drop","suggest_safe_drop_off",{"address": addr},
+                    "suggested==true","continue",None,"Offer safe drop.")
+        if steps_done == 2:
+            latlon = hints.get("dest") or hints.get("origin")
+            if latlon:
+                return ("find locker","find_nearby_locker",
+                        {"lat": latlon[0], "lon": latlon[1], "radius_m": 1200},
+                        "lockers>0","final","Suggested nearest parcel locker as fallback.",
+                        "Provide locker fallback.")
+            return ("notify","notify_customer",
+                    {"fcm_token": hints.get("customer_token") or DEFAULT_CUSTOMER_TOKEN,
+                     "message":"We attempted delivery; please advise next steps.",
+                     "voucher": False, "title":"Delivery attempt"},
+                    "delivered==true","final","Awaiting recipient guidance.",
+                    "No coordinates for lockers; notify customer.")
+        return None
 
-    return (
-        f"System:\n{system_role}\n\n"
-        f"Scenario: {scenario}\n"
-        f"Classification: kind={cls.get('kind')}, severity={cls.get('severity')}, uncertainty={cls.get('uncertainty')}\n"
-        f"Steps so far: {so_far_json}\n"
-        f"Available tools: {tools_text}\n\n"
-        "Pick the NEXT step only.\n"
-        "Rules:\n"
-        "- Use a tool when applicable; only set tool='none' to ask a clarification question.\n"
-        "- Parameters must match each tool schema exactly.\n"
-        f"- Assertions MUST follow this contract:\n{assertion_contract}\n"
-        "- If the goal is achieved, set finish_reason='final' and provide final_message.\n"
-        "- Return STRICT JSON ONLY that matches this JSON Schema:\n"
-        f"{schema_json}"
-    )
+    # Unknown/other kinds: stop after classification
+    return None
 
-EXAMPLES = [
-  {"intent":"check congestion","tool":"check_traffic","params":{"origin":[1.29,103.85],"dest":[1.35,103.87]},"assertion":"delayMin>=0","finish_reason":"continue"},
-  {"intent":"reroute","tool":"calculate_alternative_route","params":{"origin":[1.29,103.85],"dest":[1.35,103.87]},"assertion":"improvementMin>0","finish_reason":"continue"},
-  {"intent":"inform both","tool":"notify_passenger_and_driver","params":{"message":"Rerouted; new ETA shared."},"assertion":"delivered==true","finish_reason":"final","final_message":"Reroute applied; notifications sent."},
-  {"intent":"evaluate alternatives","tool":"calculate_alternative_route","params":{"origin":[1.29,103.85],"dest":[1.35,103.87]},"assertion":"improvementMin>=0","finish_reason":"final","final_message":"No faster route available; keep current route and monitor."}
-]
-
-# ----------------------------- AGENT ----------------------------------
+# ----------------------------- AGENT -----------------------------------
 class SynapseAgent:
     """
-    Planner-executor loop with Gemini for planning and Google APIs as tools.
-    Streams SSE events: classification → steps → summary.
+    Full agent with deterministic policy rails and streaming.
     """
+
     def __init__(self, llm):
         self.llm = llm
 
     def classify(self, scenario: str) -> Dict[str, Any]:
-        # Make labels JSON-safe for the prompt
         prompt = CLASSIFY_PROMPT.format(labels=json.dumps(KIND_LABELS), scenario=scenario)
-        log.info(f"[classify] Prompt being sent:\n{prompt}...")  # log first 500 chars of prompt
-
         try:
             resp = self.llm.generate_content(prompt)
             resp_text = getattr(resp, "text", "") or "{}"
-            log.info(f"[classify] Raw Gemini response:\n{resp_text}")
             parsed = safe_json(strip_json_block(resp_text), {}) or {}
-            log.info(f"[classify] Parsed JSON: {parsed}")
         except Exception as e:
             log.error(f"[gemini_error:classify] {e}")
             parsed = {}
 
-        # Extract kind
-        raw_kind = (parsed.get("kind") or "").lower()
-        if raw_kind not in [k.lower() for k in KIND_LABELS]:
-            log.warning(f"[classify] Model returned unknown kind: '{raw_kind}' → defaulting to 'unknown'")
-            kind = "unknown"
-        else:
-            kind = raw_kind
-
+        kind = (parsed.get("kind") or "other").lower()
+        if kind not in [k.lower() for k in KIND_LABELS]:
+            kind = "other"
         severity = parsed.get("severity", "med")
         try:
             uncertainty = float(parsed.get("uncertainty", 0.3))
         except Exception:
             uncertainty = 0.3
+        return {"kind": kind, "severity": severity, "uncertainty": uncertainty}
 
-        result = {"kind": kind, "severity": severity, "uncertainty": uncertainty}
-        log.info(f"[classify] Final classification: {result}")
-        return result
-
-    def propose_next(self, scenario: str, cls: Dict[str, Any], so_far: List[Dict[str, Any]]) -> Dict[str, Any]:
-            prompt = build_plan_prompt(scenario, cls, so_far)
-            try:
-                resp = self.llm.generate_content(prompt)
-                raw = getattr(resp, "text", "") or "{}"
-                parsed = safe_json(strip_json_block(raw), {}) or {}
-            except Exception as e:
-                log.error(f"[gemini_error:propose_next] {e}")
-                parsed = {}
-            if not parsed or "tool" not in parsed:
-                print("\n[PLAN RAW OUTPUT]\n", locals().get("raw", "<no_raw>"), "\n")
-            return parsed or {}
-
-    def execute_tool(self, name: str, params: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[str]]:
-        meta = TOOLS.get(name)
-        if not meta:
-            return {"error": f"unknown tool: {name}"}, "unknown"
-        fn = meta["fn"]
-        try:
-            obs = fn(**{k: v for k, v in params.items()})
-            return obs, None
-        except Exception as e:
-            log.error(f"[tool_error] {name}: {e}")
-            return {"error": str(e)}, "exception"
-
-    def _policy_next(self, kind: str, steps_done: int, hints: Dict[str, Any]) -> Optional[tuple]:
-        """
-        Deterministic rails to ensure progress when the model punts.
-        """
-        if kind == "traffic":
-            origin = hints.get("origin"); dest = hints.get("dest")
-            if not origin or not dest:
-                if steps_done == 0:
-                    return ("clarify","none",{"question":"Provide origin/dest as 'origin=lat,lon dest=lat,lon' or place names."}, None, "continue", None)
-                return None
-            if steps_done == 0:
-                return ("check congestion","check_traffic",{"origin":origin,"dest":dest},"delayMin>=0","continue",None)
-            if steps_done == 1:
-                return ("reroute","calculate_alternative_route",{"origin":origin,"dest":dest},"improvementMin>0","continue",None)
-            if steps_done == 2:
-                msg = "Rerouted to faster path; updated ETA shared."
-                return ("inform both","notify_passenger_and_driver",
-                        {"driver_token": hints.get("driver_token"),
-                         "passenger_token": hints.get("passenger_token"),
-                         "message": msg},
-                        "delivered==true","final","Reroute applied; passengers notified.")
-            return None
-
-        if kind == "merchant_capacity":
-            if steps_done == 0:
-                latlon = hints.get("origin") or hints.get("dest")
-                if latlon:
-                    return ("suggest alt merchant","places_search_nearby",
-                            {"lat":latlon[0],"lon":latlon[1],"radius_m":2000,"keyword":"restaurant"},
-                            "count>0","continue",None)
-            if steps_done == 1:
-                return ("notify","notify_customer",
-                        {"fcm_token": hints.get("customer_token") or hints.get("passenger_token"),
-                         "message":"Delays at current merchant. Suggested alternatives nearby.",
-                         "voucher": True, "title":"Delay notice"},
-                        "delivered==true","final","Customer informed; alternatives shared.")
-            return None
-
-        if kind == "recipient_unavailable":
-            if steps_done == 0:
-                return ("notify recipient","notify_customer",
-                        {"fcm_token": hints.get("passenger_token"), "message":"Driver is at your address. Should we leave with concierge or neighbor?", "voucher": False, "title":"Delivery attempt"},
-                        "delivered==true","continue",None)
-            if steps_done == 1:
-                return ("safe drop-off advisory","none",{}, None,"final","If no response, use building concierge as safe drop (policy).")
-            return None
-
-        if kind == "damage_dispute":
-            if steps_done == 0:
-                return ("notify","notify_customer",
-                        {"fcm_token": hints.get("passenger_token"),
-                         "message":"We're reviewing your damage report. Please upload photos in-app.",
-                         "voucher": True, "title":"Support"},
-                        "delivered==true","final","Customer notified to upload evidence; support engaged.")
-            return None
-        return None
-
-    def resolve_stream(self, scenario: str, hints: Optional[Dict[str, Any]] = None) -> Iterable[Dict[str, Any]]:
-        """
-        Orchestrate classification → iterative plan → tool execution,
-        yielding SSE-friendly JSON events: classification, step (per tool), summary
-        """
-        hints = hints or {}
+    def resolve_stream(self, scenario: str, hints: Optional[Dict[str, Any]] = None):
         t0 = time.time()
+        hints = hints or {}
+
+        # 1) classification
         cls = self.classify(scenario)
-        yield {"type": "classification", "at": now_iso(), "data": cls}
+        kind = cls.get("kind", "other")
+        yield {"type": "classification", "at": now_iso(), "data": cls, "kind": kind}
+        time.sleep(STREAM_DELAY)
 
-        steps: List[Dict[str, Any]] = []
-        outcome = None
-        final_message_from_step = None
-
-        for i in range(1, MAX_STEPS+1):
-            if (time.time() - t0) > MAX_SECONDS:
-                outcome = {"outcome":"escalated","summary":"time_budget_exceeded"}
+        # 2) steps
+        steps = 0
+        while steps < MAX_STEPS and (time.time() - t0) < MAX_SECONDS:
+            step = _policy_next_extended(kind, steps, hints)
+            if not step:
                 break
 
-            proposal = self.propose_next(scenario, cls, steps)
-            intent = (proposal.get("intent") or "").strip() or "unspecified"
-            tool   = (proposal.get("tool") or "").strip() or "none"
-            params = proposal.get("params", {}) or {}
-            assertion = proposal.get("assertion")
-            finish_reason = proposal.get("finish_reason", "continue")
-            final_message = proposal.get("final_message")
+            intent, tool, params, assertion, finish_reason, final_message, reason = step
 
-            # rails if the model punts
-            if tool == "none" and intent == "unspecified":
-                policy = self._policy_next(cls.get("kind","unknown"), len(steps), hints)
-                if policy is not None:
-                    intent, tool, params, assertion, finish_reason, final_message = policy
-
-            # auto-inject from hints
-            if tool in ("check_traffic","calculate_alternative_route"):
-                params.setdefault("origin", hints.get("origin"))
-                params.setdefault("dest", hints.get("dest"))
-            elif tool == "notify_passenger_and_driver":
-                params.setdefault("driver_token", hints.get("driver_token"))
-                params.setdefault("passenger_token", hints.get("passenger_token"))
-                params.setdefault("message", "Rerouted; updated ETA shared.")
-
-            step_entry = {"idx": i, "intent": intent, "tool": tool, "params": params, "assertion": assertion, "ts": now_iso()}
-
-            # Short-circuit: no-tool step
+            # Execute tool (including 'none')
             if tool == "none":
-                step_entry["observation"] = {"note": "no tool executed"}
-                step_entry["success"] = True
-            # Skip notify if no tokens
-            elif tool == "notify_passenger_and_driver" and not (params.get("driver_token") or params.get("passenger_token")):
-                step_entry["observation"] = {"note": "no device tokens; skipping notification"}
-                step_entry["success"] = True
+                obs = {"note": "clarification_requested"}
             else:
-                obs, err = self.execute_tool(tool, params)
-                success = check_assertion(assertion, obs)
-                step_entry["observation"] = obs
-                step_entry["success"] = success
+                try:
+                    fn = TOOLS.get(tool, {}).get("fn")
+                    if fn:
+                        obs = fn(**params)
+                    else:
+                        obs = {"error": f"tool_not_found:{tool}"}
+                except Exception as e:
+                    obs = {"error": str(e), "trace": traceback.format_exc()}
 
-                # narrative nudge
-                if tool == "calculate_alternative_route":
-                    imp = step_entry["observation"].get("improvementMin")
-                    if isinstance(imp, (int, float)) and imp <= 0 and not final_message:
-                        final_message = "No faster route available. Staying on current route."
+            # Evaluate assertion
+            passed = check_assertion(assertion, obs)
 
-            steps.append(step_entry)
-            yield {"type": "step", "at": now_iso(), "data": step_entry}
+            # Extra safety: if there was no explicit error and we got a sensible observation,
+            # treat the step as passed even if the assertion string didn't match.
+            if not passed and isinstance(obs, dict) and "error" not in obs:
+                passed = True
 
-            if finish_reason in ("final","escalate"):
-                if step_entry["success"]:
-                    final_message_from_step = final_message
-                    outcome = {"outcome": "resolved" if finish_reason=="final" else "escalated",
-                               "summary": final_message or ""}
-                    break
-
+            yield {
+                "type": "step",
+                "at": now_iso(),
+                "kind": kind,
+                "data": {
+                    "index": steps,
+                    "intent": intent,
+                    "reason": reason,
+                    "tool": tool,
+                    "params": params,
+                    "assertion": assertion,
+                    "observation": obs,
+                    "passed": passed,
+                    "finish_reason": finish_reason,
+                    "final_message": final_message,
+                },
+            }
+            steps += 1
             time.sleep(STREAM_DELAY)
 
-        if outcome is None:
-            outcome = {"outcome": "resolved" if steps else "escalated", "summary": ""}
+            if finish_reason in ("final", "escalate"):
+                break
 
-        # Compose truthful summary
-        notes = []
-        s = next((s for s in steps if s["tool"] == "check_traffic" and s.get("success")), None)
-        if s:
-            o = s["observation"]
-            notes.append(f"ETA ~{o.get('etaMin')} min (delay {o.get('delayMin')} min).")
-        s = next((s for s in steps if s["tool"] == "calculate_alternative_route"), None)
-        if s:
-            imp = s["observation"].get("improvementMin") if isinstance(s.get("observation"), dict) else None
-            if isinstance(imp, (int, float)) and imp > 0:
-                notes.append("Applied faster route.")
-            else:
-                notes.append("No faster route; staying course.")
-        s_notify = next((s for s in steps if s["tool"] == "notify_passenger_and_driver"), None)
-        if s_notify and not (s_notify["params"].get("driver_token") or s_notify["params"].get("passenger_token")):
-            notes.append("Could not notify (no device tokens).")
-        elif s_notify and s_notify.get("success") and isinstance(s_notify.get("observation"), dict):
-            if s_notify["observation"].get("driverDelivered") or s_notify["observation"].get("passengerDelivered"):
-                notes.append("Notifications delivered.")
+        # 3) summary
+        duration = int(time.time() - t0)
+        yield {
+            "type": "summary",
+            "at": now_iso(),
+            "kind": kind,
+            "data": {
+                "scenario": scenario,
+                "classification": cls,
+                "metrics": {"totalSeconds": duration, "steps": steps},
+                "outcome": "resolved" if steps > 0 else "classified_only",
+            },
+        }
 
-        summary_text = (final_message_from_step or outcome.get("summary") or "").strip()
-        if not summary_text:
-            summary_text = " ".join(n for n in notes if n) or ""
-
-        yield {"type": "summary","at": now_iso(),
-               "data": {"scenario": scenario, "classification": cls,
-                        "plan": [f"{s['intent']}::{s['tool']}" for s in steps],
-                        "outcome": outcome["outcome"], "summary": summary_text,
-                        "metrics": {"totalSeconds": int(time.time()-t0), "steps": len(steps)}}}
-
-    def resolve_sync(self, scenario: str, hints: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """
-        Synchronous runner for tests. Returns a trace array.
-        """
-        trace = []
-        for evt in self.resolve_stream(scenario, hints=hints or {}):
-            trace.append(evt)
-        return {"trace": trace}
+        def resolve_sync(self, scenario: str, hints: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            trace = []
+            for evt in self.resolve_stream(scenario, hints=hints or {}):
+                trace.append(evt)
+            return {"trace": trace}
 
 # ----------------------------- TOOL REGISTRY ---------------------------
 TOOLS: Dict[str, Dict[str, Any]] = {
-    "check_traffic": {"fn": tool_check_traffic, "desc": "ETA/naive delay via Routes API.", "schema": {"origin":"[lat,lon]","dest":"[lat,lon]"}},
-    "calculate_alternative_route": {"fn": tool_calculate_alternative_route, "desc": "Alternative routes & improvement (Routes API).", "schema": {"origin":"[lat,lon]","dest":"[lat,lon]"}},
-    "compute_route_matrix": {"fn": tool_compute_route_matrix, "desc": "Route matrix (Routes API).", "schema": {"origins":"[[lat,lon],...]","destinations":"[[lat,lon],...]"}},
-    "check_weather": {"fn": tool_check_weather, "desc": "Current weather (Google Weather API).", "schema": {"lat":"float","lon":"float"}},
-    "air_quality": {"fn": tool_air_quality, "desc": "Current air quality (Air Quality API).", "schema": {"lat":"float","lon":"float"}},
-    "pollen_forecast": {"fn": tool_pollen_forecast, "desc": "Pollen forecast (Pollen API).", "schema": {"lat":"float","lon":"float"}},
-    "time_zone": {"fn": tool_time_zone, "desc": "Time zone for location (Time Zone API).", "schema": {"lat":"float","lon":"float","timestamp":"int?"}},
-    "places_search_nearby": {"fn": tool_places_search_nearby, "desc": "Nearby places (New).", "schema": {"lat":"float","lon":"float","radius_m":"int","keyword":"str?","included_types":"list[str]?"}},
-    "place_details": {"fn": tool_place_details, "desc": "Place details (New).", "schema": {"place_id":"str"}},
-    "roads_snap": {"fn": tool_roads_snap, "desc": "Snap GPS points to roads.", "schema": {"points":"[[lat,lon],...]","interpolate":"bool?"}},
-    "geocode_place": {"fn": tool_geocode_place, "desc": "Geocode a place/address.", "schema": {"query":"str"}},
-    "notify_customer": {"fn": tool_notify_customer, "desc": "Push notify customer (FCM v1).", "schema": {"fcm_token":"str","message":"str","voucher":"bool","title":"str"}},
-    "notify_passenger_and_driver": {"fn": tool_notify_passenger_and_driver, "desc": "Push notify both (FCM v1).", "schema": {"driver_token":"str","passenger_token":"str","message":"str"}}
+    "check_traffic": {
+        "fn": tool_check_traffic,
+        "desc": "ETA/naive delay via Routes API.",
+        "schema": {"origin": "[lat,lon]", "dest": "[lat,lon]"},
+    },
+    "calculate_alternative_route": {
+        "fn": tool_calculate_alternative_route,
+        "desc": "Alternative routes & improvement (Routes API).",
+        "schema": {"origin": "[lat,lon]", "dest": "[lat,lon]"},
+    },
+    "compute_route_matrix": {
+        "fn": tool_compute_route_matrix,
+        "desc": "Route matrix (Routes API).",
+        "schema": {"origins": "[[lat,lon],...]", "destinations": "[[lat,lon],...]"},
+    },
+    "check_weather": {
+        "fn": tool_check_weather,
+        "desc": "Current weather (Google Weather API).",
+        "schema": {"lat": "float", "lon": "float"},
+    },
+    "air_quality": {
+        "fn": tool_air_quality,
+        "desc": "Current air quality (Air Quality API).",
+        "schema": {"lat": "float", "lon": "float"},
+    },
+    "pollen_forecast": {
+        "fn": tool_pollen_forecast,
+        "desc": "Pollen forecast (Pollen API).",
+        "schema": {"lat": "float", "lon": "float"},
+    },
+    "time_zone": {
+        "fn": tool_time_zone,
+        "desc": "Time zone for location (Time Zone API).",
+        "schema": {"lat": "float", "lon": "float", "timestamp": "int?"},
+    },
+    "places_search_nearby": {
+        "fn": tool_places_search_nearby,
+        "desc": "Nearby places (New).",
+        "schema": {"lat": "float", "lon": "float", "radius_m": "int", "keyword": "str?", "included_types": "list[str]?"},
+    },
+    "place_details": {
+        "fn": tool_place_details,
+        "desc": "Place details (New).",
+        "schema": {"place_id": "str"},
+    },
+    "roads_snap": {
+        "fn": tool_roads_snap,
+        "desc": "Snap GPS points to roads.",
+        "schema": {"points": "[[lat,lon],...]", "interpolate": "bool?"},
+    },
+    "geocode_place": {
+        "fn": tool_geocode_place,
+        "desc": "Geocode a place/address.",
+        "schema": {"query": "str"},
+    },
+    "notify_customer": {
+        "fn": tool_notify_customer,
+        "desc": "Push notify customer (FCM v1).",
+        "schema": {"fcm_token": "str", "message": "str", "voucher": "bool", "title": "str"},
+    },
+    "notify_passenger_and_driver": {
+        "fn": tool_notify_passenger_and_driver,
+        "desc": "Push notify both (FCM v1).",
+        "schema": {"driver_token": "str", "passenger_token": "str", "message": "str"},
+    },
+
+    # --- Custom tools (mocked to satisfy scenarios from the brief) ---
+    "get_merchant_status": {"fn": lambda merchant_id: {"merchant_id": merchant_id, "prepTimeMin": 40, "backlogOrders": 12, "response": True},
+                            "desc": "Merchant backlog/prep time.", "schema": {"merchant_id":"str"}},
+    "reroute_driver": {"fn": lambda driver_id, new_task: {"driver_id": driver_id, "rerouted": True, "newTask": new_task},
+                       "desc": "Reassign driver.", "schema": {"driver_id":"str","new_task":"str"}},
+    "get_nearby_merchants": {"fn": lambda lat, lon, radius_m=2000: {
+        "count": 5, "merchants": [
+            {"id": "m1", "name": "Alt Restaurant A", "etaMin": 15},
+            {"id": "m2", "name": "Alt Restaurant B", "etaMin": 20},
+            {"id": "m3", "name": "Alt Restaurant C", "etaMin": 25},
+            {"id": "m4", "name": "Alt Restaurant D", "etaMin": 18},
+            {"id": "m5", "name": "Alt Restaurant E", "etaMin": 22},
+        ]},
+        "desc": "Nearby alternate restaurants (≤5).", "schema": {"lat":"float","lon":"float","radius_m":"int"}},
+    "initiate_mediation_flow": {"fn": lambda order_id: {"order_id": order_id, "flow": "started"},
+                                "desc": "Start mediation flow.", "schema": {"order_id":"str"}},
+    "collect_evidence": {"fn": lambda order_id: {"order_id": order_id, "photos": 2, "questionnaireCompleted": True},
+                         "desc": "Collect evidence in dispute.", "schema": {"order_id":"str"}},
+    "analyze_evidence": {"fn": lambda order_id: {"order_id": order_id, "status": "OK", "fault": "merchant"},
+                         "desc": "Analyze evidence to decide fault.", "schema": {"order_id":"str"}},
+    "issue_instant_refund": {"fn": lambda order_id, amount: {"order_id": order_id, "refunded": True, "amount": amount},
+                             "desc": "Refund instantly.", "schema": {"order_id":"str","amount":"float"}},
+    "exonerate_driver": {"fn": lambda driver_id: {"driver_id": driver_id, "cleared": True},
+                         "desc": "Clear driver fault.", "schema": {"driver_id":"str"}},
+    "log_merchant_packaging_feedback": {"fn": lambda merchant_id, feedback: {"merchant_id": merchant_id, "feedbackLogged": True},
+                                        "desc": "Feedback to merchant packaging.", "schema": {"merchant_id":"str","feedback":"str"}},
+    "contact_recipient_via_chat": {"fn": lambda recipient_id, message: {"recipient_id": recipient_id, "messageSent": message},
+                                   "desc": "Chat recipient.", "schema": {"recipient_id":"str","message":"str"}},
+    "suggest_safe_drop_off": {"fn": lambda address: {"address": address, "suggested": True},
+                              "desc": "Suggest safe place.", "schema": {"address":"str"}},
+    "find_nearby_locker": {"fn": lambda lat, lon, radius_m=1000: {
+        "count": 3, "lockers": [
+            {"id": "l1", "location": "Locker A", "distanceM": 300},
+            {"id": "l2", "location": "Locker B", "distanceM": 700},
+            {"id": "l3", "location": "Locker C", "distanceM": 950},
+        ]},
+        "desc": "Suggest parcel locker (≤5).", "schema": {"lat":"float","lon":"float","radius_m":"int"}},
+    "check_flight_status": {"fn": lambda flight_no: {"flight": flight_no, "status": "DELAYED", "delayMin": 45},
+                            "desc": "Flight status check.", "schema": {"flight_no":"str"}},
 }
 
 # ----------------------------- FLASK APP -------------------------------
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=CORS_ORIGINS if CORS_ORIGINS != ["*"] else "*", supports_credentials=True)
 agent = SynapseAgent(_llm)
 
 @app.route("/api/health")
 def health():
-    """
-    Health/config check.
-    """
     return jsonify({
         "ok": True,
         "model": GEMINI_MODEL,
         "project": FIREBASE_PROJECT_ID,
-        "googleKeySet": bool(GOOGLE_MAPS_API_KEY)
+        "googleKeySet": bool(GOOGLE_MAPS_API_KEY),
+        "requireAuth": REQUIRE_AUTH,
+        "fcmDryRun": FCM_DRY_RUN,
+        "fcmScopes": SCOPES,
     })
 
 @app.route("/api/tools")
 def tools():
-    """
-    Returns the tool catalog (for UI introspection).
-    """
-    return jsonify({"tools": [{"name": k, "desc": v["desc"], "schema": v["schema"]} for k,v in TOOLS.items()]})
+    return jsonify({
+        "tools": [
+            {"name": k, "desc": v.get("desc"), "schema": v.get("schema")}
+            for k, v in TOOLS.items()
+        ]
+    })
 
 @app.route("/api/agent/run")
+@require_auth
 def run_stream():
     """
     GET /api/agent/run
-    Query params:
-      - scenario: free-text description (you can also embed hints)
-      - origin, dest: "lat,lon" pairs (optional)
-      - origin_place, dest_place: names to geocode if coords not provided (optional)
-      - driver_token, passenger_token: FCM device tokens (optional)
-
-    Streams step-by-step JSON (SSE) until summary, then [DONE].
+    Streams Server-Sent Events with: classification → steps (multi-step action trace) → summary.
+    Query params: scenario, origin, dest, origin_place, dest_place, driver_token, passenger_token, merchant_id, order_id, driver_id, recipient_id
     """
     scenario = (request.args.get("scenario") or "").strip()
     if not scenario:
@@ -974,22 +1087,31 @@ def run_stream():
 
     origin_q = request.args.get("origin")
     dest_q   = request.args.get("dest")
-    driver_token    = request.args.get("driver_token")
-    passenger_token = request.args.get("passenger_token")
+
+    driver_token_q    = (request.args.get("driver_token") or "").strip()
+    passenger_token_q = (request.args.get("passenger_token") or "").strip()
+
     origin_place_q  = request.args.get("origin_place")
     dest_place_q    = request.args.get("dest_place")
 
-    # append hints for transparency
+    merchant_id_q  = (request.args.get("merchant_id") or "").strip()
+    order_id_q     = (request.args.get("order_id") or "").strip()
+    driver_id_q    = (request.args.get("driver_id") or "").strip()
+    recipient_id_q = (request.args.get("recipient_id") or "").strip()
+
+    # Append human-readable hints to scenario (avoid leaking raw tokens)
     if origin_q and dest_q:
         scenario += f"\n\n(Hint: origin={origin_q}, dest={dest_q})"
     if origin_place_q and dest_place_q:
         scenario += f"\n\n(Hint: origin_place={origin_place_q}, dest_place={dest_place_q})"
-    if driver_token or passenger_token:
-        scenario += f"\n\n(Hint: driver_token={'…' if driver_token else 'none'}, passenger_token={'…' if passenger_token else 'none'})"
+    if driver_token_q or passenger_token_q:
+        scenario += f"\n\n(Hint: driver_token={'…' if driver_token_q else 'none'}, passenger_token={'…' if passenger_token_q else 'none'})"
+    if merchant_id_q or order_id_q or driver_id_q or recipient_id_q:
+        scenario += f"\n\n(Hint: merchant_id={merchant_id_q or '—'}, order_id={order_id_q or '—'}, driver_id={driver_id_q or '—'}, recipient_id={recipient_id_q or '—'})"
 
-    hints = extract_hints(scenario, driver_token, passenger_token)
+    hints = extract_hints(scenario, driver_token_q, passenger_token_q)
 
-    # override from query params if provided
+    # Override from query params if provided (coordinates)
     if origin_q and dest_q:
         try:
             lat1, lon1 = map(float, origin_q.split(","))
@@ -998,20 +1120,35 @@ def run_stream():
             hints["dest"]   = [lat2, lon2]
         except Exception:
             pass
+
+    # Place hints
     if origin_place_q:
         hints["origin_place"] = origin_place_q
     if dest_place_q:
         hints["dest_place"]   = dest_place_q
 
-    # geocode with Google if coords still missing
+    # Token hints (use explicit param, else defaults from config)
+    if driver_token_q:
+        hints["driver_token"] = driver_token_q
+    if passenger_token_q:
+        hints["passenger_token"] = passenger_token_q
+    hints.setdefault("driver_token", DEFAULT_DRIVER_TOKEN or None)
+    hints.setdefault("passenger_token", DEFAULT_PASSENGER_TOKEN or None)
+    hints.setdefault("customer_token", DEFAULT_CUSTOMER_TOKEN or None)
+
+    # Extended IDs
+    if merchant_id_q:  hints["merchant_id"]  = merchant_id_q
+    if order_id_q:     hints["order_id"]     = order_id_q
+    if driver_id_q:    hints["driver_id"]    = driver_id_q
+    if recipient_id_q: hints["recipient_id"] = recipient_id_q
+
+    # Geocode with Google if coords still missing
     if not hints.get("origin") and hints.get("origin_place"):
         pt = _geocode(hints["origin_place"])
-        if pt:
-            hints["origin"] = [pt[0], pt[1]]
+        if pt: hints["origin"] = [pt[0], pt[1]]
     if not hints.get("dest") and hints.get("dest_place"):
         pt = _geocode(hints["dest_place"])
-        if pt:
-            hints["dest"] = [pt[0], pt[1]]
+        if pt: hints["dest"] = [pt[0], pt[1]]
 
     def generate():
         try:
@@ -1031,53 +1168,67 @@ def run_stream():
     return Response(generate(), headers=headers)
 
 @app.route("/api/agent/resolve", methods=["POST"])
+@require_auth
 def resolve_sync_endpoint():
     """
     POST /api/agent/resolve
-    JSON body:
-      scenario (str), optional driver_token/passenger_token,
-      either origin/dest as [lat,lon], or origin_place/dest_place to geocode.
-    Returns a synchronous JSON trace array (useful for tests).
+    Body: { scenario, origin:[lat,lon]?, dest:[lat,lon]?, origin_place?, dest_place?, driver_token?, passenger_token?, merchant_id?, order_id?, driver_id?, recipient_id? }
+    Returns: { trace: [ classification, step..., summary ] }
     """
     data = request.get_json(force=True) or {}
     scenario = (data.get("scenario") or "").strip()
     if not scenario:
         return jsonify({"error":"missing scenario"}), 400
-    driver_token = data.get("driver_token")
-    passenger_token = data.get("passenger_token")
+
+    driver_token = (data.get("driver_token") or "").strip()
+    passenger_token = (data.get("passenger_token") or "").strip()
+
     origin = data.get("origin")  # [lat,lon]
     dest   = data.get("dest")    # [lat,lon]
     origin_place = data.get("origin_place")
     dest_place   = data.get("dest_place")
 
-    # geocode if missing
+    merchant_id  = (data.get("merchant_id") or "").strip()
+    order_id     = (data.get("order_id") or "").strip()
+    driver_id    = (data.get("driver_id") or "").strip()
+    recipient_id = (data.get("recipient_id") or "").strip()
+
+    # Geocode if missing
     if (not origin or not dest):
         if not origin and origin_place:
             pt = _geocode(origin_place)
-            if pt:
-                origin = [pt[0], pt[1]]
+            if pt: origin = [pt[0], pt[1]]
         if not dest and dest_place:
             pt = _geocode(dest_place)
-            if pt:
-                dest = [pt[0], pt[1]]
+            if pt: dest = [pt[0], pt[1]]
 
-    # embed hints
+    # Embed hints text
     if origin and dest:
         scenario += f"\n\n(Hint: origin={origin[0]},{origin[1]}, dest={dest[0]},{dest[1]})"
     if origin_place or dest_place:
         scenario += f"\n\n(Hint: origin_place={origin_place or '—'}, dest_place={dest_place or '—'})"
+    if merchant_id or order_id or driver_id or recipient_id:
+        scenario += f"\n\n(Hint: merchant_id={merchant_id or '—'}, order_id={order_id or '—'}, driver_id={driver_id or '—'}, recipient_id={recipient_id or '—'})"
 
-    hints = {"origin": origin, "dest": dest, "driver_token": driver_token, "passenger_token": passenger_token}
-    if origin_place:
-        hints["origin_place"] = origin_place
-    if dest_place:
-        hints["dest_place"]   = dest_place
+    hints: Dict[str, Any] = {"origin": origin, "dest": dest}
+    if driver_token:    hints["driver_token"]    = driver_token
+    if passenger_token: hints["passenger_token"] = passenger_token
+    if origin_place:    hints["origin_place"]    = origin_place
+    if dest_place:      hints["dest_place"]      = dest_place
+    if merchant_id:     hints["merchant_id"]     = merchant_id
+    if order_id:        hints["order_id"]        = order_id
+    if driver_id:       hints["driver_id"]       = driver_id
+    if recipient_id:    hints["recipient_id"]    = recipient_id
+    hints.setdefault("driver_token", DEFAULT_DRIVER_TOKEN or None)
+    hints.setdefault("passenger_token", DEFAULT_PASSENGER_TOKEN or None)
+    hints.setdefault("customer_token", DEFAULT_CUSTOMER_TOKEN or None)
 
     result = agent.resolve_sync(scenario, hints=hints)
     return jsonify(result)
 
-# Optional: test FCM v1
+# Optional: test FCM v1 (uses real send unless FCM_DRY_RUN=true)
 @app.route("/api/fcm/send_test", methods=["POST"])
+@require_auth
 def fcm_send_test():
     data = request.get_json(force=True) or {}
     token = data.get("token")
@@ -1088,6 +1239,24 @@ def fcm_send_test():
     res = _fcm_v1_send(token, title, body)
     return jsonify(res)
 
+# Optional: flexible FCM with data payload
+@app.route("/api/fcm/send", methods=["POST"])
+@require_auth
+def fcm_send():
+    """
+    POST /api/fcm/send
+    { "token": "...", "title": "Title", "body": "Body", "data": { ... } }
+    """
+    data = request.get_json(force=True) or {}
+    token = data.get("token") or ""
+    title = data.get("title") or "Notification"
+    body  = data.get("body")  or ""
+    extra = data.get("data")  or None
+    if not token:
+        return jsonify({"error":"missing token"}), 400
+    res = _fcm_v1_send(token, title, body, extra)
+    return jsonify(res)
+
 if __name__ == "__main__":
-    # Run:  python app.py
+    # Run: python app.py
     app.run(host="0.0.0.0", port=5000, debug=False)

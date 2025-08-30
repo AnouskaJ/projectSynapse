@@ -1,90 +1,52 @@
-import React, { useMemo, useState } from "react";
+"use client"
 
-export default function ScenarioForm({ defaultScenario = "", defaultOriginPlace = "", defaultDestPlace = "", onRun }) {
-  const [scenario, setScenario] = useState(defaultScenario);
-  const [originPlace, setOriginPlace] = useState(defaultOriginPlace);
-  const [destPlace, setDestPlace] = useState(defaultDestPlace);
-  const [origin, setOrigin] = useState(""); // "lat,lon" optional
-  const [dest, setDest] = useState("");     // "lat,lon" optional
+import { useMemo, useState } from "react"
 
-  const canRun = useMemo(() => scenario.trim().length > 0, [scenario]);
+export default function ScenarioForm({ defaultScenario = "", onRun }) {
+  const [scenario, setScenario] = useState(defaultScenario)
+  const canRun = useMemo(() => scenario.trim().length > 0, [scenario])
+
+  const count = scenario.length
+  const helperId = "scenario-helper"
 
   const submit = (e) => {
-    e.preventDefault();
-    if (!canRun) return;
-    onRun?.({
-      scenario: scenario.trim(),
-      origin_place: originPlace.trim() || undefined,
-      dest_place: destPlace.trim() || undefined,
-      origin: origin.trim() || undefined,
-      dest: dest.trim() || undefined
-    });
-  };
+    e.preventDefault()
+    if (!canRun) return
+    onRun?.(scenario.trim())
+  }
 
   return (
-    <form onSubmit={submit} className="card space-y-4">
+    <form onSubmit={submit} className="card space-y-4 p-4">
       <div>
-        <label className="block text-sm text-gray-300 mb-1">Scenario</label>
+        <label htmlFor="scenario" className="block text-sm text-gray-300 mb-1">
+          Scenario
+        </label>
         <textarea
-          className="w-full rounded-xl bg-black/30 border border-grab-edge px-3 py-2 min-h-[96px]"
+          id="scenario"
+          aria-describedby={helperId}
+          className="w-full rounded-xl bg-black/30 border border-[var(--grab-edge)] px-3 py-2 min-h-[130px] focus:outline-none focus:ring-2 focus:ring-[var(--grab-green)]"
           placeholder="Describe the disruption scenario…"
           value={scenario}
           onChange={(e) => setScenario(e.target.value)}
+          style={{ lineHeight: 1.5 }}
         />
-      </div>
-
-      <div className="grid md:grid-cols-2 gap-3">
-        <div>
-          <label className="block text-sm text-gray-300 mb-1">Origin place (optional)</label>
-          <input
-            className="w-full rounded-xl bg-black/30 border border-grab-edge px-3 py-2"
-            placeholder="e.g., Marina Bay Sands"
-            value={originPlace}
-            onChange={(e) => setOriginPlace(e.target.value)}
-          />
-        </div>
-        <div>
-          <label className="block text-sm text-gray-300 mb-1">Destination place (optional)</label>
-          <input
-            className="w-full rounded-xl bg-black/30 border border-grab-edge px-3 py-2"
-            placeholder="e.g., Changi Airport"
-            value={destPlace}
-            onChange={(e) => setDestPlace(e.target.value)}
-          />
+        <div id={helperId} className="k mt-1">
+          {count} characters
         </div>
       </div>
-
-      <div className="grid md:grid-cols-2 gap-3">
-        <div>
-          <label className="block text-sm text-gray-300 mb-1">Origin coordinates (optional)</label>
-          <input
-            className="w-full rounded-xl bg-black/30 border border-grab-edge px-3 py-2"
-            placeholder="lat,lon (overrides origin place)"
-            value={origin}
-            onChange={(e) => setOrigin(e.target.value)}
-          />
-        </div>
-        <div>
-          <label className="block text-sm text-gray-300 mb-1">Destination coordinates (optional)</label>
-          <input
-            className="w-full rounded-xl bg-black/30 border border-grab-edge px-3 py-2"
-            placeholder="lat,lon (overrides dest place)"
-            value={dest}
-            onChange={(e) => setDest(e.target.value)}
-          />
-        </div>
-      </div>
-
-      <div className="flex gap-2">
-        <button type="submit" className="btn btn-primary" disabled={!canRun}>Run</button>
+      <div className="flex gap-2 flex-wrap">
+        <button type="submit" className="btn btn-primary" disabled={!canRun}>
+          Run
+        </button>
         <button
           type="button"
           className="btn btn-ghost"
-          onClick={() => { setScenario(defaultScenario || ""); setOriginPlace(defaultOriginPlace || ""); setDestPlace(defaultDestPlace || ""); setOrigin(""); setDest(""); }}
+          onClick={() => setScenario(defaultScenario || "")}
+          title="Reset to default scenario"
         >
           Reset
         </button>
       </div>
     </form>
-  );
+  )
 }

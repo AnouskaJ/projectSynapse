@@ -1,3 +1,55 @@
+:root {
+  --grab-green: #00b14f;
+  --grab-bg: #0b1210; /* page background */
+  --grab-surface: #0f1915; /* cards/surfaces */
+  --grab-edge: #1a2a23; /* subtle borders */
+  --grab-text: #e6f2ed; /* main text */
+  --grab-muted: #8aa095; /* muted text */
+  --radius: 12px;
+  /* status accents */
+  --ok: #10b981; /* emerald-500 */
+  --ok-800: #065f46;
+  --err: #f43f5e; /* rose-500 */
+  --err-800: #7f1d1d;
+  --warn: #f59e0b; /* amber-500 */
+}
+
+html,
+body {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji",
+    "Segoe UI Emoji";
+  color: var(--grab-text);
+  background: var(--grab-bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code,
+kbd,
+samp,
+pre {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
+    monospace;
+}
+pre {
+  font-size: 15px; /* increased from small default */
+  line-height: 1.6;
+  background: #0a130f;
+  color: #cfeadd;
+  border: 1px solid var(--grab-edge);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  overflow: auto;
+}
+
+.container {
+  width: 100%;
+  max-width: 1120px;
+  margin: 0 auto;
+  padding-left: 16px;
+  padding-right: 16px;
+}
+
 #root {
   max-width: 1280px;
   margin: 0 auto;
@@ -34,9 +86,154 @@
 }
 
 .card {
+  background: var(--grab-surface);
+  border: 1px solid var(--grab-edge);
+  border-radius: var(--radius);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.2), 0 10px 24px rgba(0, 0, 0, 0.3);
   padding: 2em;
 }
 
 .read-the-docs {
   color: #888;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--grab-edge);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--grab-text);
+  font-size: 12px;
+  line-height: 1;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 38px;
+  padding: 0 14px;
+  border-radius: 10px;
+  border: 1px solid var(--grab-edge);
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--grab-text);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  transition: background 160ms ease, border-color 160ms ease, transform 80ms ease;
+}
+.btn:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+.btn:active {
+  transform: translateY(1px);
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: var(--grab-green);
+  border-color: #078d41;
+  color: #07110c;
+}
+.btn-primary:hover {
+  filter: brightness(0.95);
+}
+.btn-primary:active {
+  transform: translateY(1px);
+}
+
+.btn-ghost {
+  background: transparent;
+}
+.btn-ghost:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+/* Active step emphasis */
+.step-active {
+  /* subtle glow + clear border using brand green */
+  box-shadow: 0 0 0 1px rgba(0, 177, 79, 0.45), 0 10px 24px rgba(0, 0, 0, 0.35), inset 0 0 0 1px
+    rgba(255, 255, 255, 0.02);
+  border-color: rgba(0, 177, 79, 0.55) !important;
+}
+
+/* Timeline progress bar */
+.timeline {
+  position: relative;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--grab-edge);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.timeline__bar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0%;
+  background: linear-gradient(90deg, var(--grab-green), #12d46a);
+  box-shadow: 0 0 12px rgba(18, 212, 106, 0.35);
+  transition: width 380ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+/* Button icons unify vertical alignment */
+.btn .icon {
+  font-size: 14px;
+  line-height: 1;
+  opacity: 0.9;
+  margin-right: 6px;
+}
+
+/* Improve small label contrast */
+.k {
+  color: var(--grab-muted);
+  font-size: 12px;
+  letter-spacing: .02em;
+  text-transform: uppercase;
+}
+
+.cli {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
+    monospace;
+  font-size: 17px; /* bump CLI font size for better legibility */
+  line-height: 1.6;
+  background: #07110c;
+  color: #b7f0ce;
+  border: 1px solid var(--grab-edge);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  overflow: auto;
+}
+
+/* Completed connector color helpers for the timeline line */
+.conn-complete {
+  background: rgba(16, 185, 129, 0.6); /* emerald-500 */
+}
+.conn-upcoming {
+  background: var(--grab-edge);
+}
+
+/* Micro animation used by the active timeline dot */
+@keyframes pulseDot {
+  0% {
+    box-shadow: 0 0 0 0 rgba(0, 177, 79, 0.55);
+  }
+  70% {
+    box-shadow: 0 0 0 8px rgba(0, 177, 79, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(0, 177, 79, 0);
+  }
+}
+.timeline-dot-active {
+  animation: pulseDot 1.8s ease-out infinite;
+}
+
+:focus-visible {
+  outline: 2px solid var(--grab-green);
+  outline-offset: 2px;
 }
