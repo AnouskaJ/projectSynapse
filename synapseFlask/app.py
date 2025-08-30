@@ -141,6 +141,9 @@ def http_post(url: str, json_body: Dict[str, Any], headers: Dict[str, str], time
         return {"ok": False, "status": r.status_code, "error_text": r.text}
 
 # ----------------------------- UTIL -----------------------------------
+from uuid import uuid4
+from threading import Lock
+
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
@@ -179,6 +182,41 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     dlmb = _m.radians(lon2 - lon1)
     a = _m.sin(dphi/2)**2 + _m.cos(phi1)*_m.cos(phi2)*_m.sin(dlmb/2)**2
     return 2 * R * _m.asin(_m.sqrt(a))
+
+# Interactive session storage (in-memory; stateless deployments should swap to Redis)
+SESSIONS: Dict[str, Any] = {}
+SESSIONS_LOCK = Lock()
+
+def _session_save(session_id: str, payload: Dict[str, Any]) -> None:
+    with SESSIONS_LOCK:
+        SESSIONS[session_id] = payload
+
+def _session_load(session_id: str) -> Optional[Dict[str, Any]]:
+    with SESSIONS_LOCK:
+        return SESSIONS.get(session_id)
+
+def _session_delete(session_id: str) -> None:
+    with SESSIONS_LOCK:
+        SESSIONS.pop(session_id, None)
+
+def _merge_answers(hints: Dict[str, Any], answers: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if answers and isinstance(answers, dict):
+        existing = hints.get("answers") or {}
+        existing.update(answers)
+        hints["answers"] = existing
+    return hints
+
+def _truthy_str(v: Any) -> Optional[bool]:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if s in {"y","yes","true","1"}:
+        return True
+    if s in {"n","no","false","0"}:
+        return False
+    return None
 
 # -------------------------- HINT EXTRACTORS ---------------------------
 HINT_RE_ORIGIN = re.compile(r"origin\s*=\s*([0-9.+-]+)\s*,\s*([0-9.+-]+)", re.I)
@@ -252,14 +290,31 @@ def _seconds_to_minutes_str_dur(sec_str: str) -> float:
     except Exception:
         return 0.0
 
-def tool_check_traffic(origin: List[float], dest: List[float]) -> Dict[str, Any]:
-    if not origin or not dest or len(origin) != 2 or len(dest) != 2:
-        return {"error": "invalid_coordinates"}
+def _coerce_point(any_val: Any) -> Optional[List[float]]:
+    """
+    Accepts [lat, lon] or "place string"; returns [lat, lon] or None.
+    """
+    if isinstance(any_val, (list, tuple)) and len(any_val) == 2:
+        try:
+            return [float(any_val[0]), float(any_val[1])]
+        except Exception:
+            return None
+    if isinstance(any_val, str) and any_val.strip():
+        pt = _geocode(any_val.strip())
+        if pt:
+            return [pt[0], pt[1]]
+    return None
+
+def tool_check_traffic(origin_any: Any, dest_any: Any, travel_mode: str = "DRIVE") -> Dict[str, Any]:
+    origin = _coerce_point(origin_any)
+    dest   = _coerce_point(dest_any)
+    if not origin or not dest:
+        return {"error": "invalid_coordinates_or_places"}
 
     body = {
         "origin": {"location": {"latLng": {"latitude": origin[0], "longitude": origin[1]}}},
         "destination": {"location": {"latLng": {"latitude": dest[0], "longitude": dest[1]}}},
-        "travelMode": "DRIVE",
+        "travelMode": travel_mode,
         "routingPreference": "TRAFFIC_AWARE_OPTIMAL",
         "departureTime": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "computeAlternativeRoutes": False
@@ -275,23 +330,28 @@ def tool_check_traffic(origin: List[float], dest: List[float]) -> Dict[str, Any]
         dist_km = (float(r0.get("distanceMeters", 0.0)) or 0.0) / 1000.0
         baseline_min = (dist_km / BASELINE_SPEED_KMPH) * 60.0 if dist_km else 0.0
         delay_min = max(0.0, round(eta_min - baseline_min, 1))
-        return {"etaMin": eta_min, "delayMin": delay_min, "distanceKm": round(dist_km, 2)}
+        return {"etaMin": eta_min, "delayMin": delay_min, "distanceKm": round(dist_km, 2), "mode": travel_mode}
     except Exception as e:
-        dist_km = round(haversine_km(origin[0], origin[1], dest[0], dest[1]), 3)
+        # Fallback approximation
+        dist_km = 0.0
+        try:
+            dist_km = round(haversine_km(origin[0], origin[1], dest[0], dest[1]), 3)
+        except Exception:
+            pass
         eta_min = round((dist_km / BASELINE_SPEED_KMPH) * 60.0, 1) if dist_km else 0.0
         return {"approximate": True, "reason": f"routes_failure:{str(e)}",
-                "distanceKm": round(dist_km, 2), "etaMin": eta_min, "delayMin": 0.0}
+                "distanceKm": round(dist_km, 2), "etaMin": eta_min, "delayMin": 0.0, "mode": travel_mode}
 
-def tool_calculate_alternative_route(origin: List[float], dest: List[float]) -> Dict[str, Any]:
-    if not origin or not dest or len(origin) != 2 or len(dest) != 2:
-        return {"error": "invalid_coordinates"}
+def tool_calculate_alternative_route(origin_any: Any, dest_any: Any, travel_mode: str = "DRIVE") -> Dict[str, Any]:
+    origin = _coerce_point(origin_any)
+    dest   = _coerce_point(dest_any)
+    if not origin or not dest:
+        return {"error": "invalid_coordinates_or_places"}
 
     body = {
-        "origin": {"location": {"latLng": {"latitude": origin[0], "longitude": origin[1]}}}
-        ,
-        "destination": {"location": {"latLng": {"latitude": dest[0], "longitude": dest[1]}}}
-        ,
-        "travelMode": "DRIVE",
+        "origin": {"location": {"latLng": {"latitude": origin[0], "longitude": origin[1]}}},
+        "destination": {"location": {"latLng": {"latitude": dest[0], "longitude": dest[1]}}},
+        "travelMode": travel_mode,
         "routingPreference": "TRAFFIC_AWARE_OPTIMAL",
         "departureTime": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "computeAlternativeRoutes": True
@@ -310,28 +370,38 @@ def tool_calculate_alternative_route(origin: List[float], dest: List[float]) -> 
         base = out[0]["etaMin"]
         best = min(out, key=lambda x: x["etaMin"])
         improvement = max(0.0, round(base - best["etaMin"], 1))
-        return {"routes": out, "best": best, "improvementMin": improvement}
+        return {"routes": out, "best": best, "improvementMin": improvement, "mode": travel_mode}
     except Exception as e:
-        dist_km = round(haversine_km(origin[0], origin[1], dest[0], dest[1]), 3)
+        # Approx fallback
+        try:
+            dist_km = round(haversine_km(origin[0], origin[1], dest[0], dest[1]), 3)
+        except Exception:
+            dist_km = 0.0
         eta_min = round((dist_km / 30.0) * 60.0, 1) if dist_km else 0.0
         return {"routes": [{"etaMin": eta_min, "distanceKm": round(dist_km, 2)}],
                 "best": {"etaMin": eta_min, "distanceKm": round(dist_km, 2)},
                 "improvementMin": 0.0, "approximate": True,
-                "reason": f"routes_failure:{str(e)}"}
+                "reason": f"routes_failure:{str(e)}", "mode": travel_mode}
 
-def tool_compute_route_matrix(origins: List[List[float]], destinations: List[List[float]]) -> Dict[str, Any]:
+def tool_compute_route_matrix(origins: List[Any], destinations: List[Any]) -> Dict[str, Any]:
     if not origins or not destinations:
         return {"error": "missing_origins_or_destinations"}
 
-    def wp(pt):
+    def wp_from_any(pt_any):
+        pt = _coerce_point(pt_any)
+        if not pt: raise ValueError("bad_point")
         return {"waypoint": {"location": {"latLng": {"latitude": pt[0], "longitude": pt[1]}}}}
 
-    body = {
-        "origins": [wp(o) for o in origins],
-        "destinations": [wp(d) for d in destinations],
-        "travelMode": "DRIVE",
-        "routingPreference": "TRAFFIC_AWARE"
-    }
+    try:
+        body = {
+            "origins": [wp_from_any(o) for o in origins],
+            "destinations": [wp_from_any(d) for d in destinations],
+            "travelMode": "DRIVE",
+            "routingPreference": "TRAFFIC_AWARE"
+        }
+    except Exception:
+        return {"error": "bad_points"}
+
     field_mask = "originIndex,destinationIndex,duration,distanceMeters,status,condition"
     url_path = "distanceMatrix/v2:computeRouteMatrix"
     try:
@@ -394,7 +464,11 @@ def tool_pollen_forecast(lat: float, lon: float) -> Dict[str, Any]:
     except Exception as e:
         return {"error": f"pollen_failure:{str(e)}"}
 
-def tool_places_search_nearby(lat: float, lon: float, radius_m: int = 2000, keyword: Optional[str] = None, included_types: Optional[List[str]] = None) -> Dict[str, Any]:
+def tool_places_search_nearby(lat_any: Any, lon_any: Any, radius_m: int = 2000, keyword: Optional[str] = None, included_types: Optional[List[str]] = None) -> Dict[str, Any]:
+    pt = _coerce_point([lat_any, lon_any]) if not (isinstance(lat_any, (int,float)) and isinstance(lon_any, (int,float))) else [lat_any, lon_any]
+    if not pt: return {"error": "invalid_center"}
+    lat, lon = pt
+
     body = {
         "locationRestriction": {
             "circle": {
@@ -522,7 +596,6 @@ def tool_notify_passenger_and_driver(driver_token: Optional[str], passenger_toke
     return {"driverDelivered": d.get("delivered"), "passengerDelivered": p.get("delivered")}
 
 # ----------------------------- ASSERTIONS ------------------------------
-# --- replace the whole check_assertion with this ---
 def check_assertion(assertion: Optional[str], observation: Dict[str, Any]) -> bool:
     """
     Return True when:
@@ -532,7 +605,6 @@ def check_assertion(assertion: Optional[str], observation: Dict[str, Any]) -> bo
     """
     # No explicit assertion → pass unless an error key exists
     if not assertion or not str(assertion).strip():
-        # if observation contains an explicit error field, fail
         if isinstance(observation, dict) and ("error" in observation or "trace" in observation):
             return False
         return True
@@ -547,7 +619,6 @@ def check_assertion(assertion: Optional[str], observation: Dict[str, Any]) -> bo
         s = str(v).strip().lower()
         return s in {"true","1","yes","y","ok"}
 
-    # Common canned predicates (case-insensitive)
     if "response!=none" in a:
         return isinstance(observation, dict) and len(observation) > 0
 
@@ -559,7 +630,6 @@ def check_assertion(assertion: Optional[str], observation: Dict[str, Any]) -> bo
         return _truthy(observation.get("customerAck"))
 
     if "delivered==true" in a:
-        # supports notify_customer and notify_passenger_and_driver
         return (_truthy(observation.get("delivered"))
                 or _truthy(observation.get("driverDelivered"))
                 or _truthy(observation.get("passengerDelivered")))
@@ -631,21 +701,17 @@ def check_assertion(assertion: Optional[str], observation: Dict[str, Any]) -> bo
         key = a.split("has.", 1)[1]
         return key in observation
 
-    # Final generic equality like foo==bar, normalized
     if "==" in a and all(op not in a for op in (">", "<", "!=")):
         k, val = a.split("==", 1)
         ov = observation.get(k)
-        # normalize both sides
         sval = val.strip().lower()
         if sval in {"true","false"}:
             return _truthy(ov) == (sval == "true")
         try:
-            # numeric compare if possible
             return float(str(ov)) == float(sval)
         except Exception:
             return str(ov).strip().lower() == sval
 
-    # If we can’t parse, be safe: don’t fail the step
     return True
 
 # ----------------------------- PROMPTS --------------------------------
@@ -691,22 +757,27 @@ def _policy_next_extended(kind: str, steps_done: int, hints: Dict[str, Any]) -> 
     """
     # Traffic
     if kind == "traffic":
-        origin = hints.get("origin"); dest = hints.get("dest")
-        if not origin or not dest:
-            if steps_done == 0:
-                return ("clarify", "none",
-                        {"question":"Provide origin/dest as 'origin=lat,lon dest=lat,lon' or place names."},
-                        None, "continue", None,
-                        "No coordinates; ask for origin/dest.")
-            return None
+        origin = hints.get("origin") or hints.get("origin_place")
+        dest   = hints.get("dest")   or hints.get("dest_place")
+        mode   = (hints.get("mode") or "DRIVE").upper()
+
+        # Ask for origin/destination if neither present (interactive)
+        if (not origin or not dest) and steps_done == 0:
+            q = {
+                "question_id": "route_text",
+                "question": "Please provide origin and destination (e.g., 'origin=SRM, dest=Chennai airport').",
+                "expected": "text",
+            }
+            return ("ask for route","ask_user", q, None, "await_input", None, "Need origin/dest to proceed.")
+
         if steps_done == 0:
             return ("check congestion","check_traffic",
-                    {"origin":origin,"dest":dest},
+                    {"origin_any": origin, "dest_any": dest, "travel_mode": mode},
                     "delayMin>=0","continue",None,
                     "Measure baseline ETA and traffic delay.")
         if steps_done == 1:
             return ("reroute","calculate_alternative_route",
-                    {"origin":origin,"dest":dest},
+                    {"origin_any": origin, "dest_any": dest, "travel_mode": mode},
                     "improvementMin>=0","continue",None,
                     "Compute alternatives and pick fastest.")
         if steps_done == 2:
@@ -732,7 +803,7 @@ def _policy_next_extended(kind: str, steps_done: int, hints: Dict[str, Any]) -> 
 
         if (steps_done == 1) and (latlon is not None):
             return ("suggest alt merchant","get_nearby_merchants",
-                    {"lat": latlon[0], "lon": latlon[1], "radius_m": 2000},
+                    {"lat": latlon[0] if isinstance(latlon, list) else latlon, "lon": latlon[1] if isinstance(latlon, list) else latlon, "radius_m": 2000},
                     "merchants>0","continue",None,
                     "Suggest up to 5 nearby alternates.")
         if (steps_done == 1) and (latlon is None):
@@ -797,18 +868,32 @@ def _policy_next_extended(kind: str, steps_done: int, hints: Dict[str, Any]) -> 
                     "Send resolution push.")
         return None
 
-    # Recipient unavailable
+    # Recipient unavailable (interactive permission step)
     if kind == "recipient_unavailable":
+        answers = hints.get("answers") or {}
+
         if steps_done == 0:
             rid = hints.get("recipient_id","recipient_demo")
             return ("reach out via chat","contact_recipient_via_chat",
                     {"recipient_id": rid, "message":"Driver has arrived. How should we proceed?"},
                     "messagesent!=none","continue",None,"Start chat to coordinate.")
         if steps_done == 1:
-            addr = hints.get("dest_place") or "Building concierge"
-            return ("suggest safe drop","suggest_safe_drop_off",{"address": addr},
-                    "suggested==true","continue",None,"Offer safe drop.")
-        if steps_done == 2:
+            decision = _truthy_str(answers.get("safe_drop_ok"))
+            if decision is None:
+                q = {
+                    "question_id": "safe_drop_ok",
+                    "question": "Recipient unavailable. Is it okay to leave the package with the building concierge or a neighbor?",
+                    "expected": "boolean",
+                    "options": ["yes","no"]
+                }
+                return ("ask permission","ask_user", q,
+                        None, "await_input", None,
+                        "Need user's permission for safe drop.")
+            if decision is True:
+                addr = hints.get("dest_place") or "Building concierge"
+                return ("suggest safe drop","suggest_safe_drop_off",{"address": addr},
+                        "suggested==true","final","Proposed safe drop-off at concierge; awaiting confirmation in app.",
+                        "Offer safe drop.")
             latlon = hints.get("dest") or hints.get("origin")
             if latlon:
                 return ("find locker","find_nearby_locker",
@@ -817,7 +902,7 @@ def _policy_next_extended(kind: str, steps_done: int, hints: Dict[str, Any]) -> 
                         "Provide locker fallback.")
             return ("notify","notify_customer",
                     {"fcm_token": hints.get("customer_token") or DEFAULT_CUSTOMER_TOKEN,
-                     "message":"We attempted delivery; please advise next steps.",
+                     "message":"Delivery attempted; please advise next steps in the app.",
                      "voucher": False, "title":"Delivery attempt"},
                     "delivered==true","final","Awaiting recipient guidance.",
                     "No coordinates for lockers; notify customer.")
@@ -855,9 +940,24 @@ class SynapseAgent:
             uncertainty = 0.3
         return {"kind": kind, "severity": severity, "uncertainty": uncertainty}
 
-    def resolve_stream(self, scenario: str, hints: Optional[Dict[str, Any]] = None):
+    def resolve_stream(
+        self,
+        scenario: str,
+        hints: Optional[Dict[str, Any]] = None,
+        *,
+        session_id: Optional[str] = None,
+        start_at_step: int = 0,
+        resume: bool = False
+    ):
+        """
+        Streams events. If 'resume' is True, we continue from a saved session_id.
+        """
         t0 = time.time()
         hints = hints or {}
+        sid = session_id or str(uuid4())
+
+        # 0) announce session id
+        yield {"type": "session", "at": now_iso(), "data": {"session_id": sid}}
 
         # 1) classification
         cls = self.classify(scenario)
@@ -866,7 +966,18 @@ class SynapseAgent:
         time.sleep(STREAM_DELAY)
 
         # 2) steps
-        steps = 0
+        steps = max(0, int(start_at_step))
+        last_final_message = None
+        awaiting_q: Optional[Dict[str, Any]] = None
+
+        # If user provided a free-text route in answers, fold it back into scenario/hints
+        # (for traffic clarify flow)
+        answers = hints.get("answers") or {}
+        route_text = (answers.get("route_text") or "").strip() if isinstance(answers.get("route_text"), str) else ""
+        if route_text and ("origin" not in hints and "origin_place" not in hints):
+            rhints = extract_hints(route_text, hints.get("driver_token"), hints.get("passenger_token"))
+            hints.update({k: v for k, v in rhints.items() if k in ("origin","dest","origin_place","dest_place")})
+
         while steps < MAX_STEPS and (time.time() - t0) < MAX_SECONDS:
             step = _policy_next_extended(kind, steps, hints)
             if not step:
@@ -874,24 +985,20 @@ class SynapseAgent:
 
             intent, tool, params, assertion, finish_reason, final_message, reason = step
 
-            # Execute tool (including 'none')
-            if tool == "none":
-                obs = {"note": "clarification_requested"}
+            # Execute tool (including pseudo tools)
+            if tool in ("none", "ask_user"):
+                obs = {"note": "clarification_requested"} if tool == "none" else {"awaiting": True, **(params or {})}
             else:
                 try:
                     fn = TOOLS.get(tool, {}).get("fn")
-                    if fn:
+                    if callable(fn):
                         obs = fn(**params)
                     else:
-                        obs = {"error": f"tool_not_found:{tool}"}
+                        obs = {"error": f"tool_not_found_or_not_callable:{tool}"}
                 except Exception as e:
                     obs = {"error": str(e), "trace": traceback.format_exc()}
 
-            # Evaluate assertion
             passed = check_assertion(assertion, obs)
-
-            # Extra safety: if there was no explicit error and we got a sensible observation,
-            # treat the step as passed even if the assertion string didn't match.
             if not passed and isinstance(obs, dict) and "error" not in obs:
                 passed = True
 
@@ -916,10 +1023,38 @@ class SynapseAgent:
             time.sleep(STREAM_DELAY)
 
             if finish_reason in ("final", "escalate"):
+                last_final_message = final_message
                 break
 
-        # 3) summary
+            if finish_reason == "await_input":
+                _session_save(sid, {
+                    "scenario": scenario,
+                    "hints": hints,
+                    "kind": kind,
+                    "steps_done": steps,
+                    "savedAt": now_iso(),
+                })
+                awaiting_q = {
+                    "session_id": sid,
+                    "question_id": (params or {}).get("question_id"),
+                    "question": (params or {}).get("question"),
+                    "expected": (params or {}).get("expected"),
+                    "options": (params or {}).get("options"),
+                }
+                yield {"type": "clarify", "at": now_iso(), "data": awaiting_q, "kind": kind}
+                break
+
+        # 3) summary (always include a message)
         duration = int(time.time() - t0)
+        outcome = "resolved" if (last_final_message is not None) else ("await_input" if awaiting_q else ("classified_only" if steps == 0 else "incomplete"))
+        summary_message = (
+            last_final_message
+            or (f"Awaiting input: {awaiting_q['question']}" if awaiting_q else "No further steps were taken.")
+        )
+
+        if outcome != "await_input":
+            _session_delete(sid)
+
         yield {
             "type": "summary",
             "at": now_iso(),
@@ -928,32 +1063,33 @@ class SynapseAgent:
                 "scenario": scenario,
                 "classification": cls,
                 "metrics": {"totalSeconds": duration, "steps": steps},
-                "outcome": "resolved" if steps > 0 else "classified_only",
+                "outcome": outcome,
+                "message": summary_message,
             },
         }
 
-        def resolve_sync(self, scenario: str, hints: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-            trace = []
-            for evt in self.resolve_stream(scenario, hints=hints or {}):
-                trace.append(evt)
-            return {"trace": trace}
+    def resolve_sync(self, scenario: str, hints: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        trace = []
+        for evt in self.resolve_stream(scenario, hints=hints or {}):
+            trace.append(evt)
+        return {"trace": trace}
 
 # ----------------------------- TOOL REGISTRY ---------------------------
 TOOLS: Dict[str, Dict[str, Any]] = {
     "check_traffic": {
         "fn": tool_check_traffic,
-        "desc": "ETA/naive delay via Routes API.",
-        "schema": {"origin": "[lat,lon]", "dest": "[lat,lon]"},
+        "desc": "ETA/naive delay via Routes API (accepts coords or place text).",
+        "schema": {"origin_any": "str|[lat,lon]", "dest_any": "str|[lat,lon]", "travel_mode": "DRIVE|TWO_WHEELER|WALK|BICYCLE|TRANSIT"},
     },
     "calculate_alternative_route": {
         "fn": tool_calculate_alternative_route,
         "desc": "Alternative routes & improvement (Routes API).",
-        "schema": {"origin": "[lat,lon]", "dest": "[lat,lon]"},
+        "schema": {"origin_any": "str|[lat,lon]", "dest_any": "str|[lat,lon]", "travel_mode": "str"},
     },
     "compute_route_matrix": {
         "fn": tool_compute_route_matrix,
         "desc": "Route matrix (Routes API).",
-        "schema": {"origins": "[[lat,lon],...]", "destinations": "[[lat,lon],...]"},
+        "schema": {"origins": "[any,...]", "destinations": "[any,...]"},
     },
     "check_weather": {
         "fn": tool_check_weather,
@@ -977,12 +1113,12 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     },
     "places_search_nearby": {
         "fn": tool_places_search_nearby,
-        "desc": "Nearby places (New).",
-        "schema": {"lat": "float", "lon": "float", "radius_m": "int", "keyword": "str?", "included_types": "list[str]?"},
+        "desc": "Nearby places (Places API).",
+        "schema": {"lat": "float|str", "lon": "float|str", "radius_m": "int", "keyword": "str?", "included_types": "list[str]?"},
     },
     "place_details": {
         "fn": tool_place_details,
-        "desc": "Place details (New).",
+        "desc": "Place details (Places API).",
         "schema": {"place_id": "str"},
     },
     "roads_snap": {
@@ -1006,7 +1142,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "schema": {"driver_token": "str", "passenger_token": "str", "message": "str"},
     },
 
-    # --- Custom tools (mocked to satisfy scenarios from the brief) ---
+    # --- Custom tools / mocks ---
     "get_merchant_status": {"fn": lambda merchant_id: {"merchant_id": merchant_id, "prepTimeMin": 40, "backlogOrders": 12, "response": True},
                             "desc": "Merchant backlog/prep time.", "schema": {"merchant_id":"str"}},
     "reroute_driver": {"fn": lambda driver_id, new_task: {"driver_id": driver_id, "rerouted": True, "newTask": new_task},
@@ -1045,6 +1181,13 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "desc": "Suggest parcel locker (≤5).", "schema": {"lat":"float","lon":"float","radius_m":"int"}},
     "check_flight_status": {"fn": lambda flight_no: {"flight": flight_no, "status": "DELAYED", "delayMin": 45},
                             "desc": "Flight status check.", "schema": {"flight_no":"str"}},
+
+    # Pseudo tool to pause & request user input
+    "ask_user": {
+        "fn": lambda **kwargs: {"awaiting": True, **kwargs},
+        "desc": "Pause chain and ask user a question; resume when answered.",
+        "schema": {"question_id": "str", "question": "str", "expected": "str?", "options": "list[str]?"},
+    },
 }
 
 # ----------------------------- FLASK APP -------------------------------
@@ -1077,11 +1220,62 @@ def tools():
 @require_auth
 def run_stream():
     """
-    GET /api/agent/run
-    Streams Server-Sent Events with: classification → steps (multi-step action trace) → summary.
-    Query params: scenario, origin, dest, origin_place, dest_place, driver_token, passenger_token, merchant_id, order_id, driver_id, recipient_id
+    GET /api/agent/run  (SSE)
+    First run:
+      - scenario: the scenario text
+      - (optional) origin, dest, origin_place, dest_place, tokens, etc.
+      - (optional) answers: JSON string to seed answers
+    Resume:
+      - session_id: id from a previous run where we emitted "clarify"
+      - answers: JSON string with the user's responses (e.g., {"safe_drop_ok":"yes"})
     """
-    scenario = (request.args.get("scenario") or "").strip()
+    scenario_q = (request.args.get("scenario") or "").strip()
+    session_id_q = (request.args.get("session_id") or request.args.get("resume_session") or "").strip()
+    answers_q = request.args.get("answers")
+    answers_dict = safe_json(answers_q, {}) if answers_q else {}
+
+    # ---------- Resume flow ----------
+    if session_id_q:
+        session = _session_load(session_id_q)
+        if not session:
+            return jsonify({"error": "invalid_session"}), 400
+        scenario = session["scenario"]
+        hints = session["hints"] or {}
+        start_at = int(session.get("steps_done", 0))
+
+        _merge_answers(hints, answers_dict)
+
+        # Allow token overrides on resume
+        driver_token_q    = (request.args.get("driver_token") or "").strip()
+        passenger_token_q = (request.args.get("passenger_token") or "").strip()
+        if driver_token_q:    hints["driver_token"] = driver_token_q
+        if passenger_token_q: hints["passenger_token"] = passenger_token_q
+
+        def generate():
+            try:
+                for evt in agent.resolve_stream(
+                    scenario,
+                    hints=hints,
+                    session_id=session_id_q,
+                    start_at_step=start_at,
+                    resume=True,
+                ):
+                    yield sse(evt)
+                yield sse("[DONE]")
+            except Exception as e:
+                yield sse({"type":"error","at":now_iso(),"data":{"message":str(e),"trace":traceback.format_exc()}})
+                yield sse("[DONE]")
+
+        headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control":"no-cache",
+            "Connection":"keep-alive",
+            "X-Accel-Buffering":"no"
+        }
+        return Response(generate(), headers=headers)
+
+    # ---------- First run ----------
+    scenario = scenario_q
     if not scenario:
         return jsonify({"error":"missing scenario"}), 400
 
@@ -1099,7 +1293,7 @@ def run_stream():
     driver_id_q    = (request.args.get("driver_id") or "").strip()
     recipient_id_q = (request.args.get("recipient_id") or "").strip()
 
-    # Append human-readable hints to scenario (avoid leaking raw tokens)
+    # Append human-readable hints (avoid leaking raw tokens)
     if origin_q and dest_q:
         scenario += f"\n\n(Hint: origin={origin_q}, dest={dest_q})"
     if origin_place_q and dest_place_q:
@@ -1127,7 +1321,7 @@ def run_stream():
     if dest_place_q:
         hints["dest_place"]   = dest_place_q
 
-    # Token hints (use explicit param, else defaults from config)
+    # Token hints
     if driver_token_q:
         hints["driver_token"] = driver_token_q
     if passenger_token_q:
@@ -1142,13 +1336,16 @@ def run_stream():
     if driver_id_q:    hints["driver_id"]    = driver_id_q
     if recipient_id_q: hints["recipient_id"] = recipient_id_q
 
-    # Geocode with Google if coords still missing
+    # Geocode with Google if coords still missing (based on place names)
     if not hints.get("origin") and hints.get("origin_place"):
         pt = _geocode(hints["origin_place"])
         if pt: hints["origin"] = [pt[0], pt[1]]
     if not hints.get("dest") and hints.get("dest_place"):
         pt = _geocode(hints["dest_place"])
         if pt: hints["dest"] = [pt[0], pt[1]]
+
+    # Merge any provided answers on first run too
+    _merge_answers(hints, answers_dict)
 
     def generate():
         try:
@@ -1172,10 +1369,25 @@ def run_stream():
 def resolve_sync_endpoint():
     """
     POST /api/agent/resolve
-    Body: { scenario, origin:[lat,lon]?, dest:[lat,lon]?, origin_place?, dest_place?, driver_token?, passenger_token?, merchant_id?, order_id?, driver_id?, recipient_id? }
+    Body: { scenario?, session_id?, answers?, origin:[lat,lon]?, dest:[lat,lon]?, origin_place?, dest_place?, driver_token?, passenger_token?, merchant_id?, order_id?, driver_id?, recipient_id? }
     Returns: { trace: [ classification, step..., summary ] }
     """
     data = request.get_json(force=True) or {}
+
+    # Resume mode
+    session_id = (data.get("session_id") or "").strip()
+    answers    = data.get("answers") or {}
+    if session_id:
+        session = _session_load(session_id)
+        if not session:
+            return jsonify({"error":"invalid_session"}), 400
+        scenario = session["scenario"]
+        hints = session["hints"] or {}
+        _merge_answers(hints, answers)
+        result = agent.resolve_sync(scenario, hints=hints)
+        return jsonify(result)
+
+    # First-run mode
     scenario = (data.get("scenario") or "").strip()
     if not scenario:
         return jsonify({"error":"missing scenario"}), 400
@@ -1222,6 +1434,8 @@ def resolve_sync_endpoint():
     hints.setdefault("driver_token", DEFAULT_DRIVER_TOKEN or None)
     hints.setdefault("passenger_token", DEFAULT_PASSENGER_TOKEN or None)
     hints.setdefault("customer_token", DEFAULT_CUSTOMER_TOKEN or None)
+
+    _merge_answers(hints, answers)
 
     result = agent.resolve_sync(scenario, hints=hints)
     return jsonify(result)

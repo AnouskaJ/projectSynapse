@@ -1,12 +1,12 @@
 // src/components/AgentStream.jsx
 "use client"
 
-import React, { useEffect, useRef, useState } from "react"
+import React, { useEffect, useMemo, useRef, useState } from "react"
 import { API_BASE, buildRunUrl } from "../utils/api"
 
 // Firebase Messaging (frontend)
 import { getMessaging, onMessage, isSupported } from "firebase/messaging"
-import { app } from "../lib/firebase" // initialized Firebase app
+import { app } from "../lib/firebase"
 import { ensureFreshFcmToken, refreshFcmToken } from "../lib/fcm-token"
 
 /* ------------ Small UI helpers ------------ */
@@ -15,16 +15,14 @@ const Pill = ({ children, tone = "neutral" }) => {
     tone === "ok"
       ? "bg-emerald-900/40 text-emerald-300 border-emerald-800"
       : tone === "warn"
-        ? "bg-amber-900/40 text-amber-300 border-amber-800"
-        : tone === "err"
-          ? "bg-rose-900/40 text-rose-300 border-rose-800"
-          : "bg-slate-800/60 text-slate-300 border-slate-700"
+      ? "bg-amber-900/40 text-amber-300 border-amber-800"
+      : tone === "err"
+      ? "bg-rose-900/40 text-rose-300 border-rose-800"
+      : "bg-slate-800/60 text-slate-300 border-slate-700"
   return <span className={`pill border ${cls}`}>{children}</span>
 }
-
 const K = ({ children }) => <span className="text-gray-400">{children}</span>
 
-/* Pretty printer */
 function PrettyObject({ data }) {
   if (data == null) return <div className="text-gray-400">—</div>
   if (typeof data !== "object") return <div className="text-gray-200 break-words">{String(data)}</div>
@@ -179,6 +177,11 @@ export default function AgentStream({ scenarioText }) {
   const playSpeed = 900
   const esRef = useRef(null)
 
+  // Clarify / resume state
+  const [sessionId, setSessionId] = useState("")
+  const [clarify, setClarify] = useState(null)
+  const [answerDraft, setAnswerDraft] = useState("")
+
   // FCM state
   const [fcmSupported, setFcmSupported] = useState(false)
   const [fcmToken, setFcmToken] = useState("")
@@ -188,49 +191,40 @@ export default function AgentStream({ scenarioText }) {
     ? `${API_BASE}/api/agent/run?${new URLSearchParams({ scenario: scenarioText }).toString()}`
     : ""
 
-  // Bootstrap FCM: detect support, hook foreground messages
-// In AgentStream.jsx, where you already bootstrap FCM:
-useEffect(() => {
-  let off = () => {};
-  (async () => {
-    const supported = await isSupported();
-    setFcmSupported(supported);
-    if (!supported) return;
+  // Bootstrap FCM
+  useEffect(() => {
+    let off = () => {}
+    ;(async () => {
+      const supported = await isSupported()
+      setFcmSupported(supported)
+      if (!supported) return
 
-    // Ensure SW is registered (root scope)
-    const reg = (await navigator.serviceWorker.getRegistration()) ||
-                (await navigator.serviceWorker.register("/firebase-messaging-sw.js"));
+      const reg =
+        (await navigator.serviceWorker.getRegistration()) ||
+        (await navigator.serviceWorker.register("/firebase-messaging-sw.js"))
 
-    const messaging = getMessaging(app);
+      const messaging = getMessaging(app)
+      off = onMessage(messaging, async (payload) => {
+        console.log("[FCM] foreground payload:", payload)
+        if (Notification.permission === "granted") {
+          const title = payload?.notification?.title || "Notification"
+          const body = payload?.notification?.body || ""
+          const data = payload?.data || {}
+          const swr =
+            (await navigator.serviceWorker.getRegistration()) || reg
+          swr?.showNotification(title, {
+            body,
+            data,
+            tag: payload?.messageId,
+            requireInteraction: true,
+          })
+        }
+      })
+    })()
 
-    off = onMessage(messaging, async (payload) => {
-      console.log("[FCM] foreground payload:", payload);
+    return () => off()
+  }, [])
 
-      // If you prefer a toast, show it here and return.
-
-      // Show a native notification while tab is focused:
-      if (Notification.permission === "granted") {
-        const title = payload?.notification?.title || "Notification";
-        const body  = payload?.notification?.body  || "";
-        const data  = payload?.data || {};
-
-        // Use the active service worker to show a system notification
-        const swr = (await navigator.serviceWorker.getRegistration()) || reg;
-        swr?.showNotification(title, {
-          body,
-          data,                     // carry any deep-link info
-          tag: payload?.messageId,  // avoid stacking dupes
-          // icon: "/icon-192x192.png", // optional
-          requireInteraction: true  // keeps it visible until user clicks
-        });
-      }
-    });
-  })();
-
-  return () => off();
-}, []);
-
-  // Always keep a fresh token in state when notifications are allowed
   const refreshTokenIfNeeded = async () => {
     try {
       const tok = await ensureFreshFcmToken()
@@ -245,15 +239,81 @@ useEffect(() => {
     }
   }, [])
 
+  const closeStream = () => {
+    if (esRef.current) {
+      try { esRef.current.close() } catch {}
+      esRef.current = null
+    }
+  }
+
+  const handleSSELine = async (line) => {
+    setRawLines((prev) => [...prev, line])
+    if (!line) return
+    if (line === "[DONE]") {
+      setStatus("done")
+      closeStream()
+      setFollowLive(false)
+      return
+    }
+    try {
+      const payload = JSON.parse(line)
+
+      // capture session id
+      if (payload?.type === "session" && payload?.data?.session_id) {
+        setSessionId(payload.data.session_id)
+      }
+
+      // auto rotate FCM token on UNREGISTERED
+      const err = payload?.data?.observation?.error
+      const errCode =
+        err?.errorCode ||
+        (typeof err === "object" &&
+        JSON.stringify(err).includes('"UNREGISTERED"')
+          ? "UNREGISTERED"
+          : null)
+      if (errCode === "UNREGISTERED") {
+        const newTok = await refreshFcmToken()
+        if (newTok) setFcmToken(newTok)
+      }
+
+      // show clarify panel
+      if (payload?.type === "clarify") {
+        setClarify(payload.data || null)
+        setStatus("awaiting")
+      }
+
+      setEvents((prev) => [...prev, payload])
+    } catch {
+      /* ignore non-JSON pings */
+    }
+  }
+
+  const wireSSE = (url) => {
+    const es = new EventSource(url)
+    esRef.current = es
+    es.onmessage = (evt) => handleSSELine(evt.data)
+    es.onerror = () => {
+      setStatus("error")
+      setError("Stream error. Ensure backend is running, CORS allowed, and token is valid.")
+      closeStream()
+    }
+  }
+
   const start = async () => {
     if (!scenarioText) return
-    if (esRef.current) { esRef.current.close(); esRef.current = null }
+    closeStream()
 
-    setActiveIndex(-1); setIsPlaying(false); setFollowLive(true)
-    setEvents([]); setRawLines([]); setError(""); setStatus("streaming")
+    setActiveIndex(-1)
+    setIsPlaying(false)
+    setFollowLive(true)
+    setEvents([])
+    setRawLines([])
+    setError("")
+    setClarify(null)
+    setSessionId("")
+    setStatus("streaming")
 
     try {
-      // Make sure we use a live token
       const liveToken = fcmToken || (await ensureFreshFcmToken())
       if (liveToken && liveToken !== fcmToken) setFcmToken(liveToken)
 
@@ -263,57 +323,83 @@ useEffect(() => {
         customer_token: liveToken || undefined,
       })
 
-      const es = new EventSource(urlWithToken)
-      esRef.current = es
-
-      es.onmessage = async (evt) => {
-        const line = evt.data
-        setRawLines((prev) => [...prev, line])
-        if (!line) return
-
-        if (line === "[DONE]") {
-          setStatus("done"); es.close(); esRef.current = null; setFollowLive(false)
-          return
-        }
-
-        try {
-          const payload = JSON.parse(line)
-          // If backend says UNREGISTERED, rotate the token so the next run succeeds
-          const err = payload?.data?.observation?.error
-          const errCode =
-            err?.errorCode ||
-            (typeof err === "object" && JSON.stringify(err).includes('"UNREGISTERED"') ? "UNREGISTERED" : null)
-          if (errCode === "UNREGISTERED") {
-            const newTok = await refreshFcmToken()
-            if (newTok) setFcmToken(newTok)
-          }
-
-          setEvents((prev) => [...prev, payload])
-        } catch {
-          // ignore non-JSON pings
-        }
-      }
-
-      es.onerror = () => {
-        setStatus("error")
-        setError("Stream error. Ensure backend is running, CORS allowed, and token is valid.")
-        es.close(); esRef.current = null
-      }
+      wireSSE(urlWithToken)
     } catch (e) {
-      setStatus("error"); setError(e.message || "Failed to start stream")
+      setStatus("error")
+      setError(e.message || "Failed to start stream")
+    }
+  }
+
+  const resumeWithAnswer = async (answerValue) => {
+    if (!sessionId) return
+    closeStream()
+    setStatus("streaming")
+
+    try {
+      const liveToken = fcmToken || (await ensureFreshFcmToken())
+      if (liveToken && liveToken !== fcmToken) setFcmToken(liveToken)
+
+      const answers = {}
+      if (clarify?.question_id) {
+        answers[clarify.question_id] = answerValue
+      }
+      // clear current clarify box
+      setClarify(null)
+      setAnswerDraft("")
+
+      const url = await buildRunUrl({
+        session_id: sessionId,
+        answers: JSON.stringify(answers),
+        passenger_token: liveToken || undefined,
+        customer_token: liveToken || undefined,
+      })
+
+      wireSSE(url)
+    } catch (e) {
+      setStatus("error")
+      setError(e.message || "Failed to resume")
     }
   }
 
   const stop = () => {
-    if (esRef.current) { esRef.current.close(); esRef.current = null }
-    setStatus("done"); setIsPlaying(false); setFollowLive(false)
+    closeStream()
+    setStatus("done")
+    setIsPlaying(false)
+    setFollowLive(false)
   }
 
-  const classification = events.find((e) => e.type === "classification")?.data
-  const steps = events.filter((e) => e.type === "step").map((e) => ({ ...e.data, ts: e.at }))
-  const summary = events.find((e) => e.type === "summary")?.data
+  const classification = useMemo(() => events.find((e) => e.type === "classification")?.data, [events])
+  const steps = useMemo(
+    () => events.filter((e) => e.type === "step").map((e) => ({ ...e.data, ts: e.at })),
+    [events]
+  )
+  const summaryEvt = useMemo(() => events.find((e) => e.type === "summary")?.data, [events])
 
-  useEffect(() => { if (followLive && steps.length > 0) setActiveIndex(steps.length - 1) }, [steps.length, followLive])
+  // message-first summary (backend now sends data.message)
+  const summaryText = useMemo(() => {
+    if (!summaryEvt) return ""
+    const msg = summaryEvt.message || summaryEvt.summary // fallback if older backend
+    if (msg && String(msg).trim()) return msg
+
+    const kind = classification?.kind
+    const sev = classification?.severity
+    const stepsCount = summaryEvt?.metrics?.steps
+    const outcome = summaryEvt?.outcome
+    const lastFinalMsg =
+      steps.length ? steps[steps.length - 1]?.final_message || steps[steps.length - 1]?.finalMessage : ""
+
+    const bits = []
+    if (outcome) bits.push(`Outcome: ${outcome}`)
+    if (typeof stepsCount === "number") bits.push(`${stepsCount} step${stepsCount === 1 ? "" : "s"}`)
+    if (kind) bits.push(`Kind: ${kind}${sev ? ` (${sev})` : ""}`)
+    if (lastFinalMsg) bits.push(lastFinalMsg)
+
+    return bits.join(" • ") || "Scenario processed."
+  }, [summaryEvt, classification, steps])
+
+  useEffect(() => {
+    if (followLive && steps.length > 0) setActiveIndex(steps.length - 1)
+  }, [steps.length, followLive])
   useEffect(() => {
     if (!isPlaying) return
     const id = setInterval(() => setActiveIndex((i) => Math.min((i ?? -1) + 1, steps.length - 1)), playSpeed)
@@ -325,6 +411,45 @@ useEffect(() => {
     if (el) el.scrollIntoView({ behavior: "smooth", block: "center" })
   }, [activeIndex])
 
+  /* ------------ Views ------------ */
+  const ClarifyView = clarify && (
+    <div className="card p-5 border-amber-800 bg-amber-950/30">
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-sm uppercase tracking-wider text-amber-300">Clarification needed</div>
+        <Pill tone="warn">awaiting</Pill>
+      </div>
+      <div className="text-gray-200 mb-3">{clarify.question || "Please provide more info."}</div>
+
+      {/* Controls based on expected type */}
+      {clarify.expected === "boolean" ? (
+        <div className="flex gap-2">
+          <button className="btn btn-primary" onClick={() => resumeWithAnswer("yes")}>Yes</button>
+          <button className="btn btn-ghost" onClick={() => resumeWithAnswer("no")}>No</button>
+        </div>
+      ) : (
+        <div className="flex gap-2">
+          <input
+            className="input flex-1"
+            placeholder="Type your answer…"
+            value={answerDraft}
+            onChange={(e) => setAnswerDraft(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") resumeWithAnswer(answerDraft) }}
+          />
+          <button className="btn btn-primary" onClick={() => resumeWithAnswer(answerDraft)}>Send</button>
+        </div>
+      )}
+
+      {clarify.options && Array.isArray(clarify.options) && clarify.options.length > 0 && (
+        <div className="mt-3 text-sm text-gray-400">Options: {clarify.options.join(" / ")}</div>
+      )}
+      {sessionId && (
+        <div className="mt-2 text-xs text-gray-500">
+          session: <code>{sessionId}</code>
+        </div>
+      )}
+    </div>
+  )
+
   const GUIView = (
     <div className="space-y-6">
       {/* Push status */}
@@ -332,11 +457,12 @@ useEffect(() => {
         <div className="text-sm">
           <div className="font-medium mb-1">Push Delivery</div>
           <div className="text-gray-400">
-            {fcmSupported ? "Web Push is supported" : "Web Push not supported"}
-            {" • "}
+            {fcmSupported ? "Web Push is supported" : "Web Push not supported"}{" • "}
             Permission: <strong>{notifPermission}</strong>
             {fcmToken && (
-              <> {" • "} Token: <code className="text-xs">{fcmToken.slice(0, 12)}…{fcmToken.slice(-8)}</code> </>
+              <>
+                {" • "} Token: <code className="text-xs">{fcmToken.slice(0, 12)}…{fcmToken.slice(-8)}</code>
+              </>
             )}
           </div>
         </div>
@@ -366,15 +492,36 @@ useEffect(() => {
         </section>
       )}
 
-      {summary && (
+      {/* Clarify panel (only when backend requested input) */}
+      {ClarifyView}
+
+      {summaryEvt && (
         <div className="card p-5">
           <div className="flex items-center justify-between mb-2">
             <div className="text-sm uppercase tracking-wider text-gray-400">Summary</div>
-            <Pill tone={summary.outcome === "resolved" ? "ok" : summary.outcome === "escalated" ? "warn" : "neutral"}>
-              {summary.outcome}
+            <Pill
+              tone={
+                summaryEvt.outcome === "resolved"
+                  ? "ok"
+                  : summaryEvt.outcome === "escalated"
+                  ? "warn"
+                  : "neutral"
+              }
+            >
+              {summaryEvt.outcome || "—"}
             </Pill>
           </div>
-          <div className="text-gray-200 mb-3">{summary.summary || "—"}</div>
+
+          {/* Show summary as a message */}
+          <div className="rounded-xl bg-[rgba(0,0,0,0.35)] border border-[var(--grab-edge)] p-3">
+            <div className="text-gray-200">{summaryText || "—"}</div>
+          </div>
+
+          {sessionId && summaryEvt.outcome === "await_input" && (
+            <div className="mt-2 text-xs text-gray-500">
+              Awaiting response. Session <code>{sessionId}</code> will resume when you answer above.
+            </div>
+          )}
         </div>
       )}
     </div>
