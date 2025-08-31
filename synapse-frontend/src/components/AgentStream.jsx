@@ -58,28 +58,22 @@ function PrettyObject({ data }) {
 }
 
 /* Step card */
-/* Step card */
-/* Step card */
 function StepItem({ step, index, active = false, complete = false }) {
   const [open, setOpen] = React.useState(true)
   const ok = step.passed === true
 
-  // Remove noisy fields from what the step card prints
   const scrub = (obj) => {
     if (!obj || typeof obj !== "object") return obj
     if (Array.isArray(obj)) return obj.map(scrub)
     const copy = { ...obj }
-    // Always hide options so only the Clarify panel shows them
     if ("options" in copy) delete copy.options
-    // Optional: hide these duplicates/noise on the step card
     if ("awaiting" in copy) delete copy.awaiting
     if ("session_id" in copy) delete copy.session_id
     return copy
   }
 
-  // Scrub both params and observation (some older flows put options in either)
   const paramsForView = scrub(step.params)
-  const obsForView    = scrub(step.observation)
+  const obsForView = scrub(step.observation)
 
   return (
     <div
@@ -88,7 +82,6 @@ function StepItem({ step, index, active = false, complete = false }) {
       style={{ animation: `fadeInUp 400ms ease ${index * 80}ms both` }}
       aria-current={active ? "step" : undefined}
     >
-      {/* Timeline dot and line */}
       <div className="absolute left-0 top-2">
         <div
           className={`w-3 h-3 rounded-full ${ok ? "bg-emerald-400" : "bg-rose-400"} ring-4 ring-[var(--grab-bg)] ${
@@ -116,7 +109,6 @@ function StepItem({ step, index, active = false, complete = false }) {
           </div>
         </div>
 
-        {/* meta row */}
         <div className="grid md:grid-cols-3 gap-4">
           <div>
             <div className="text-xs text-gray-400 mb-1">Tool</div>
@@ -148,8 +140,6 @@ function StepItem({ step, index, active = false, complete = false }) {
     </div>
   )
 }
-
-
 
 /* GUI/CLI toggle */
 function ViewToggle({ mode, setMode }) {
@@ -184,6 +174,40 @@ style.innerHTML = `
 if (!document.getElementById("fadeInUpKeyframes")) {
   style.id = "fadeInUpKeyframes"
   document.head.appendChild(style)
+}
+
+/* ------------ Helper for image clarify ------------ */
+function ImageAnswer({ onSubmit }) {
+  const [files, setFiles] = React.useState(null)
+  const [busy, setBusy] = React.useState(false)
+  return (
+    <div className="flex flex-col gap-2">
+      <input
+        type="file"
+        accept="image/*"
+        multiple
+        onChange={(e) => setFiles(e.target.files)}
+        className="input"
+      />
+      <button
+        className="btn btn-primary"
+        disabled={busy || !files || files.length === 0}
+        onClick={async () => {
+          setBusy(true)
+          try {
+            await onSubmit(files)
+          } finally {
+            setBusy(false)
+          }
+        }}
+      >
+        {busy ? "Uploading…" : "Upload & Continue"}
+      </button>
+      <div className="text-xs text-gray-500">
+        Tip: include the seal, any spillage, and the outer bag.
+      </div>
+    </div>
+  )
 }
 
 /* ------------ Main component ------------ */
@@ -269,146 +293,141 @@ export default function AgentStream({ scenarioText }) {
     }
   }
 
-const handleSSELine = async (line) => {
-  setRawLines((prev) => [...prev, line])
-  if (!line) return
-  if (line === "[DONE]") {
-    setStatus("done")
-    closeStream()
-    setFollowLive(false)
-    return
-  }
-
-  try {
-    const payload = JSON.parse(line)
-
-    // session id (sent at session start, and also on clarify)
-    if (payload?.type === "session" && payload?.data?.session_id) {
-      setSessionId(payload.data.session_id)
-    }
-    if (payload?.type === "clarify" && payload?.data?.session_id) {
-      setSessionId(payload.data.session_id)
-    }
-
-    // auto rotate FCM token on UNREGISTERED
-    const err = payload?.data?.observation?.error
-    const errCode =
-      err?.errorCode ||
-      (typeof err === "object" && JSON.stringify(err).includes('"UNREGISTERED"') ? "UNREGISTERED" : null)
-    if (errCode === "UNREGISTERED") {
-      const newTok = await refreshFcmToken()
-      if (newTok) setFcmToken(newTok)
-    }
-
-    // show clarify panel
-    if (payload?.type === "clarify") {
-      setClarify(payload.data || null)
-      setStatus("awaiting")
-    }
-
-    setEvents((prev) => [...prev, payload])
-  } catch {
-    /* ignore non-JSON pings */
-  }
-}
-
-const wireSSE = (url) => {
-  const es = new EventSource(url)
-  esRef.current = es
-  es.onmessage = (evt) => handleSSELine(evt.data)
-  es.onerror = () => {
-    setStatus("error")
-    setError("Stream error. Ensure backend is running, CORS allowed, and token is valid.")
-    closeStream()
-  }
-}
-
-const start = async () => {
-  if (!scenarioText) return
-  closeStream()
-
-  setActiveIndex(-1)
-  setIsPlaying(false)
-  setFollowLive(true)
-  setEvents([])
-  setRawLines([])
-  setError("")
-  setClarify(null)
-  setSessionId("")
-  setStatus("streaming")
-
-  try {
-    // Ensure we have permission -> token
-    if (typeof Notification !== "undefined" && Notification.permission !== "granted") {
-      const perm = await Notification.requestPermission()
-      setNotifPermission(perm)
-      if (perm !== "granted") {
-        setStatus("error")
-        setError("Notifications are blocked. Please enable notifications to receive FCM pushes.")
-        return
-      }
-    }
-
-    const liveToken = (await ensureFreshFcmToken()) || fcmToken
-    if (!liveToken) {
-      setStatus("error")
-      setError("Could not obtain FCM token (service worker / permissions issue).")
+  const handleSSELine = async (line) => {
+    setRawLines((prev) => [...prev, line])
+    if (!line) return
+    if (line === "[DONE]") {
+      setStatus("done")
+      closeStream()
+      setFollowLive(false)
       return
     }
-    if (liveToken !== fcmToken) setFcmToken(liveToken)
 
-    // IMPORTANT: include customer_token because backend reads that for notify_customer()
-    const urlWithToken = await buildRunUrl({
-      scenario: scenarioText,
-      passenger_token: liveToken,
-      customer_token: liveToken,   // stays
-      driver_token: liveToken,     // optional: helpful for dual-notify paths
-    })
+    try {
+      const payload = JSON.parse(line)
 
-    wireSSE(urlWithToken)
-  } catch (e) {
-    setStatus("error")
-    setError(e.message || "Failed to start stream")
-  }
-}
+      // session id
+      if (payload?.type === "session" && payload?.data?.session_id) {
+        setSessionId(payload.data.session_id)
+      }
+      if (payload?.type === "clarify" && payload?.data?.session_id) {
+        setSessionId(payload.data.session_id)
+      }
 
+      // auto rotate FCM token on UNREGISTERED
+      const err = payload?.data?.observation?.error
+      const errCode =
+        err?.errorCode ||
+        (typeof err === "object" && JSON.stringify(err).includes('"UNREGISTERED"') ? "UNREGISTERED" : null)
+      if (errCode === "UNREGISTERED") {
+        const newTok = await refreshFcmToken()
+        if (newTok) setFcmToken(newTok)
+      }
 
-  // ✅ Send clarify answers to the dedicated backend endpoint
-// Replace your current resumeWithAnswer with this one
-const resumeWithAnswer = async (answerValue) => {
-  if (!sessionId) {
-    setError("Cannot resume: missing session id")
-    return
-  }
-  closeStream()
-  setStatus("streaming")
+      // show clarify panel
+      if (payload?.type === "clarify") {
+        setClarify(payload.data || null)
+        setStatus("awaiting")
+      }
 
-  try {
-    const liveToken = fcmToken || (await ensureFreshFcmToken())
-    if (liveToken && liveToken !== fcmToken) setFcmToken(liveToken)
-
-    const answers = {}
-    if (clarify?.question_id) answers[clarify.question_id] = answerValue
-    setClarify(null)
-    setAnswerDraft("")
-
-    const qs = new URLSearchParams()
-    qs.set("session_id", sessionId)              // backend accepts this to resume
-    qs.set("answers", JSON.stringify(answers))   // merge into hints.answers
-    if (liveToken) {
-      qs.set("passenger_token", liveToken)
-      qs.set("customer_token", liveToken)
+      setEvents((prev) => [...prev, payload])
+    } catch {
+      /* ignore non-JSON pings */
     }
-
-    const url = `${API_BASE}/api/agent/run?${qs.toString()}`
-    wireSSE(url)
-  } catch (e) {
-    setStatus("error")
-    setError(e.message || "Failed to resume")
   }
-}
 
+  const wireSSE = (url) => {
+    const es = new EventSource(url)
+    esRef.current = es
+    es.onmessage = (evt) => handleSSELine(evt.data)
+    es.onerror = () => {
+      setStatus("error")
+      setError("Stream error. Ensure backend is running, CORS allowed, and token is valid.")
+      closeStream()
+    }
+  }
 
+  const start = async () => {
+    if (!scenarioText) return
+    closeStream()
+
+    setActiveIndex(-1)
+    setIsPlaying(false)
+    setFollowLive(true)
+    setEvents([])
+    setRawLines([])
+    setError("")
+    setClarify(null)
+    setSessionId("")
+    setStatus("streaming")
+
+    try {
+      if (typeof Notification !== "undefined" && Notification.permission !== "granted") {
+        const perm = await Notification.requestPermission()
+        setNotifPermission(perm)
+        if (perm !== "granted") {
+          setStatus("error")
+          setError("Notifications are blocked. Please enable notifications to receive FCM pushes.")
+          return
+        }
+      }
+
+      const liveToken = (await ensureFreshFcmToken()) || fcmToken
+      if (!liveToken) {
+        setStatus("error")
+        setError("Could not obtain FCM token (service worker / permissions issue).")
+        return
+      }
+      if (liveToken !== fcmToken) setFcmToken(liveToken)
+
+      // include tokens so notify_customer works
+      const urlWithToken = await buildRunUrl({
+        scenario: scenarioText,
+        passenger_token: liveToken,
+        customer_token: liveToken,
+        driver_token: liveToken,
+      })
+
+      wireSSE(urlWithToken)
+    } catch (e) {
+      setStatus("error")
+      setError(e.message || "Failed to start stream")
+    }
+  }
+
+  // resume with clarify answers (answers go to /api/agent/run?session_id=..., server merges & resumes)
+  const resumeWithAnswer = async (answerValue) => {
+    if (!sessionId) {
+      setError("Cannot resume: missing session id")
+      return
+    }
+    closeStream()
+    setStatus("streaming")
+
+    try {
+      const liveToken = fcmToken || (await ensureFreshFcmToken())
+      if (liveToken && liveToken !== fcmToken) setFcmToken(liveToken)
+
+      const answers = {}
+      if (clarify?.question_id) answers[clarify.question_id] = answerValue
+      setClarify(null)
+      setAnswerDraft("")
+
+      const qs = new URLSearchParams()
+      qs.set("session_id", sessionId)
+      qs.set("answers", JSON.stringify(answers)) // <-- now small (filenames), NOT base64
+      if (liveToken) {
+        qs.set("passenger_token", liveToken)
+        qs.set("customer_token", liveToken)
+      }
+
+      const url = `${API_BASE}/api/agent/run?${qs.toString()}`
+      wireSSE(url)
+    } catch (e) {
+      setStatus("error")
+      setError(e.message || "Failed to resume")
+    }
+  }
 
   const stop = () => {
     closeStream()
@@ -418,13 +437,9 @@ const resumeWithAnswer = async (answerValue) => {
   }
 
   const classification = useMemo(() => events.find((e) => e.type === "classification")?.data, [events])
-  const steps = useMemo(
-    () => events.filter((e) => e.type === "step").map((e) => ({ ...e.data, ts: e.at })),
-    [events]
-  )
+  const steps = useMemo(() => events.filter((e) => e.type === "step").map((e) => ({ ...e.data, ts: e.at })), [events])
   const summaryEvt = useMemo(() => events.find((e) => e.type === "summary")?.data, [events])
 
-  // message-first summary
   const summaryText = useMemo(() => {
     if (!summaryEvt) return ""
     const msg = summaryEvt.message || summaryEvt.summary
@@ -469,8 +484,37 @@ const resumeWithAnswer = async (answerValue) => {
       </div>
       <div className="text-gray-200 mb-3">{clarify.question || "Please provide more info."}</div>
 
-      {/* Prefer explicit options when provided */}
-      {Array.isArray(clarify.options) && clarify.options.length > 0 ? (
+      {/* When images are requested, upload first, then resume with filenames */}
+      {clarify?.expected === "image[]" ? (
+  <ImageAnswer
+    onSubmit={async (fileList) => {
+      // 1) Upload files to the server (returns small filenames)
+     const fd = new FormData();
+     fd.append("order_id", "order_demo");
+     fd.append("session_id", sessionId);
+     fd.append("question_id", clarify.question_id);
+     Array.from(fileList).forEach(f => fd.append("images", f));
+     const up = await fetch(`${API_BASE}/api/evidence/upload`, { method: "POST", body: fd });
+     const { files = [] } = await up.json();
+
+      // 2) Resume the SAME session over SSE (GET). This is what continues the chain.
+      setClarify(null);
+      setStatus("streaming");
+      
+
+      const url = `${API_BASE}/api/agent/clarify/continue?` + new URLSearchParams({
+        session_id: sessionId,
+        question_id: clarify.question_id,
+        expected: "image[]",
+        answer: JSON.stringify(files),  // send small filenames, not base64
+      }).toString();
+      closeStream();
+      wireSSE(url);  // <-- re-open EventSource to continue: collect -> analyze -> refund/notify
+      
+    }}
+  />
+
+      ) : Array.isArray(clarify?.options) && clarify.options.length > 0 ? (
         <div className="flex flex-wrap gap-2">
           {clarify.options.map((opt) => (
             <button key={opt} className="btn btn-primary" onClick={() => resumeWithAnswer(opt)}>
@@ -478,7 +522,7 @@ const resumeWithAnswer = async (answerValue) => {
             </button>
           ))}
         </div>
-      ) : clarify.expected === "boolean" ? (
+      ) : clarify?.expected === "boolean" ? (
         <div className="flex gap-2">
           <button className="btn btn-primary" onClick={() => resumeWithAnswer("yes")}>
             Yes
@@ -504,7 +548,7 @@ const resumeWithAnswer = async (answerValue) => {
         </div>
       )}
 
-      {clarify.options && Array.isArray(clarify.options) && clarify.options.length > 0 && (
+      {clarify?.options && Array.isArray(clarify.options) && clarify.options.length > 0 && (
         <div className="mt-3 text-sm text-gray-400">Options: {clarify.options.join(" / ")}</div>
       )}
       {sessionId && (
@@ -563,7 +607,7 @@ const resumeWithAnswer = async (answerValue) => {
         </section>
       )}
 
-      {/* Clarify panel (only when backend requested input) */}
+      {/* Clarify panel */}
       {ClarifyView}
 
       {summaryEvt && (
@@ -575,7 +619,6 @@ const resumeWithAnswer = async (answerValue) => {
             </Pill>
           </div>
 
-          {/* Show summary as a message */}
           <div className="rounded-xl bg-[rgba(0,0,0,0.35)] border border-[var(--grab-edge)] p-3">
             <div className="text-gray-200">{summaryText || "—"}</div>
           </div>

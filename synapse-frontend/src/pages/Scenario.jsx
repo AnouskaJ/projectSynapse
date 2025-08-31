@@ -4,60 +4,47 @@ import ScenarioForm from "../components/ScenarioForm.jsx";
 import AgentStream from "../components/AgentStream.jsx";
 
 /**
- * Each scenario is phrased to:
- *  - clearly indicate the problem category (merchant_capacity, recipient_unavailable, traffic)
- *  - include plain-text origin/destination with “from … to …” when relevant
- *  - include mode hints like “mode drive / two-wheeler / bicycle / walk”
- *  - give enough context for tools: notify_*(), get_merchant_status(), calculate_alternative_route(), etc.
+ * Agency/dispatcher voice with concrete context for parsers.
  */
 const DEFAULTS = {
   grabfood: {
     title: "GrabFood",
     scenario: [
-      "Overloaded restaurant. Order GF-10234 at “Nasi Goreng House, Velachery”.",
-      "Kitchen reports prep time around 45 minutes (backlog growing).",
-      "Driver is already waiting at the merchant; customer is near DLF IT Park, Manapakkam.",
-      "Ask to minimize driver idle time and keep the customer informed.",
-      "Plan:",
-      "- Proactively notify customer about the long wait and offer a small voucher.",
-      "- If feasible, temporarily reassign the driver to a short nearby drop while food is prepared.",
-      "- If delay is critical, suggest 2–3 nearby, similar restaurants with shorter prep times.",
-      "Notes: origin_place: Nasi Goreng House, Velachery; dest_place: DLF IT Park, Manapakkam."
+      "We’re coordinating order GF-10234 from “Nasi Goreng House, Velachery” to the customer at DLF IT Park, Manapakkam (mode: two-wheeler).",
+      "Kitchen is currently quoting ~40–45 minutes and the backlog is growing. The driver is already waiting at the merchant.",
+      "Keep the customer proactively informed about the delay, minimize the driver’s idle time, and—if on-time delivery looks at risk—surface 2–3 similar nearby restaurants with faster prep as potential switches.",
+      "Route context: from Nasi Goreng House, Velachery → DLF IT Park, Manapakkam."
     ].join(" ")
   },
 
+  // UPDATED: GrabMart now uses the “Damaged Packaging Dispute” scenario
   grabmart: {
-    title: "GrabMart",
+    title: "GrabMart – Doorstep Damage Dispute",
     scenario: [
-      "Mart inventory shortage. Order GM-55871 at “QuickMart, OMR Navalur”.",
-      "Two items out of stock (almond milk 1L, brown bread).",
-      "Customer prefers fastest resolution over perfect substitutions.",
-      "Ask to propose best substitutions and nearest alternate marts if needed, then notify the customer.",
-      "Notes: origin_place: QuickMart, OMR Navalur; dest_place: Hiranandani, Egattur."
+      "We’re handling order GM-20987 picked up from “QuickMart, T. Nagar” and delivered to the customer at Olympia Tech Park, Guindy (mode: two-wheeler).",
+      "At the doorstep, the customer reports a spilled drink. It isn’t clear if this came from poor packaging at the store or something that happened during transit.",
+      "We need a quick, fair resolution on-site that doesn’t unfairly penalize the driver while still giving the customer a smooth experience. Collect clear photos from both sides and brief answers to seal/handling questions, then close the loop with a transparent outcome and share it with both parties.",
+      "Route context: QuickMart, T. Nagar → Olympia Tech Park, Guindy."
     ].join(" ")
   },
 
   grabexpress: {
     title: "GrabExpress",
     scenario: [
-      "Recipient unavailable for valuable parcel delivery.",
-      "Driver arrived at “House No. 12, 3rd Main Road, Adyar” but recipient isn’t picking up.",
-      "Building concierge accepts labelled packages only.",
-      "Ask to start chat, suggest a safe drop if approved, else find a nearby secure locker.",
-      "Notes: origin_place: Phoenix Marketcity, Velachery; dest_place: Adyar 3rd Main Road."
+      "Valuable parcel pickup at Phoenix Marketcity, Velachery with drop at House No. 12, 3rd Main Road, Adyar (mode: two-wheeler).",
+      "Driver reached the destination but the recipient isn’t responding. The building only accepts clearly labelled packages.",
+      "Reach the recipient via chat for instructions. If they authorize a safe drop (e.g., concierge) proceed accordingly; otherwise suggest a secure nearby locker and coordinate a revised handoff.",
+      "Route context: Phoenix Marketcity, Velachery → 3rd Main Road, Adyar."
     ].join(" ")
   },
 
   grabcar: {
     title: "GrabCar",
     scenario: [
-      "Sudden major traffic obstruction.",
-      "Passenger is on an urgent airport trip from SRMIST to Chennai International Airport (MAA); mode drive.",
-      "Accident reported near Tambaram causing heavy congestion on the usual route.",
-      "Need the fastest alternate route immediately and notify both driver and passenger with the new ETA.",
-      "Passenger’s flight: 6E 5119 at 22:30 (if delayed, mention to reduce anxiety).",
-      "Request: check traffic, re-calculate route, then notify_passenger_and_driver.",
-      "from SRMIST to Chennai airport, mode drive."
+      "Urgent airport ride from SRMIST to Chennai International Airport (MAA), mode: drive.",
+      "Major accident reported near Tambaram causing heavy congestion on the usual route.",
+      "Identify the fastest alternate path right now and share the updated ETA with both the passenger and driver. Passenger’s flight is 6E 5119 at 22:30—if that flight is delayed, communicate it to ease anxiety.",
+      "Route context: SRMIST → Chennai International Airport (MAA)."
     ].join(" ")
   },
 
