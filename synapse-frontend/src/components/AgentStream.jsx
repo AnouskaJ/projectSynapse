@@ -58,9 +58,29 @@ function PrettyObject({ data }) {
 }
 
 /* Step card */
+/* Step card */
+/* Step card */
 function StepItem({ step, index, active = false, complete = false }) {
   const [open, setOpen] = React.useState(true)
   const ok = step.passed === true
+
+  // Remove noisy fields from what the step card prints
+  const scrub = (obj) => {
+    if (!obj || typeof obj !== "object") return obj
+    if (Array.isArray(obj)) return obj.map(scrub)
+    const copy = { ...obj }
+    // Always hide options so only the Clarify panel shows them
+    if ("options" in copy) delete copy.options
+    // Optional: hide these duplicates/noise on the step card
+    if ("awaiting" in copy) delete copy.awaiting
+    if ("session_id" in copy) delete copy.session_id
+    return copy
+  }
+
+  // Scrub both params and observation (some older flows put options in either)
+  const paramsForView = scrub(step.params)
+  const obsForView    = scrub(step.observation)
+
   return (
     <div
       id={`step-${index}`}
@@ -116,11 +136,11 @@ function StepItem({ step, index, active = false, complete = false }) {
           <div className="mt-4 grid md:grid-cols-2 gap-4">
             <div>
               <div className="text-xs text-gray-400 mb-1">Params</div>
-              <PrettyObject data={step.params} />
+              <PrettyObject data={paramsForView} />
             </div>
             <div>
               <div className="text-xs text-gray-400 mb-1">Observation</div>
-              <PrettyObject data={step.observation} />
+              <PrettyObject data={obsForView} />
             </div>
           </div>
         )}
@@ -128,6 +148,8 @@ function StepItem({ step, index, active = false, complete = false }) {
     </div>
   )
 }
+
+
 
 /* GUI/CLI toggle */
 function ViewToggle({ mode, setMode }) {
@@ -210,8 +232,7 @@ export default function AgentStream({ scenarioText }) {
           const title = payload?.notification?.title || "Notification"
           const body = payload?.notification?.body || ""
           const data = payload?.data || {}
-          const swr =
-            (await navigator.serviceWorker.getRegistration()) || reg
+          const swr = (await navigator.serviceWorker.getRegistration()) || reg
           swr?.showNotification(title, {
             body,
             data,
@@ -241,125 +262,153 @@ export default function AgentStream({ scenarioText }) {
 
   const closeStream = () => {
     if (esRef.current) {
-      try { esRef.current.close() } catch {}
+      try {
+        esRef.current.close()
+      } catch {}
       esRef.current = null
     }
   }
 
-  const handleSSELine = async (line) => {
-    setRawLines((prev) => [...prev, line])
-    if (!line) return
-    if (line === "[DONE]") {
-      setStatus("done")
-      closeStream()
-      setFollowLive(false)
+const handleSSELine = async (line) => {
+  setRawLines((prev) => [...prev, line])
+  if (!line) return
+  if (line === "[DONE]") {
+    setStatus("done")
+    closeStream()
+    setFollowLive(false)
+    return
+  }
+
+  try {
+    const payload = JSON.parse(line)
+
+    // session id (sent at session start, and also on clarify)
+    if (payload?.type === "session" && payload?.data?.session_id) {
+      setSessionId(payload.data.session_id)
+    }
+    if (payload?.type === "clarify" && payload?.data?.session_id) {
+      setSessionId(payload.data.session_id)
+    }
+
+    // auto rotate FCM token on UNREGISTERED
+    const err = payload?.data?.observation?.error
+    const errCode =
+      err?.errorCode ||
+      (typeof err === "object" && JSON.stringify(err).includes('"UNREGISTERED"') ? "UNREGISTERED" : null)
+    if (errCode === "UNREGISTERED") {
+      const newTok = await refreshFcmToken()
+      if (newTok) setFcmToken(newTok)
+    }
+
+    // show clarify panel
+    if (payload?.type === "clarify") {
+      setClarify(payload.data || null)
+      setStatus("awaiting")
+    }
+
+    setEvents((prev) => [...prev, payload])
+  } catch {
+    /* ignore non-JSON pings */
+  }
+}
+
+const wireSSE = (url) => {
+  const es = new EventSource(url)
+  esRef.current = es
+  es.onmessage = (evt) => handleSSELine(evt.data)
+  es.onerror = () => {
+    setStatus("error")
+    setError("Stream error. Ensure backend is running, CORS allowed, and token is valid.")
+    closeStream()
+  }
+}
+
+const start = async () => {
+  if (!scenarioText) return
+  closeStream()
+
+  setActiveIndex(-1)
+  setIsPlaying(false)
+  setFollowLive(true)
+  setEvents([])
+  setRawLines([])
+  setError("")
+  setClarify(null)
+  setSessionId("")
+  setStatus("streaming")
+
+  try {
+    // Ensure we have permission -> token
+    if (typeof Notification !== "undefined" && Notification.permission !== "granted") {
+      const perm = await Notification.requestPermission()
+      setNotifPermission(perm)
+      if (perm !== "granted") {
+        setStatus("error")
+        setError("Notifications are blocked. Please enable notifications to receive FCM pushes.")
+        return
+      }
+    }
+
+    const liveToken = (await ensureFreshFcmToken()) || fcmToken
+    if (!liveToken) {
+      setStatus("error")
+      setError("Could not obtain FCM token (service worker / permissions issue).")
       return
     }
-    try {
-      const payload = JSON.parse(line)
+    if (liveToken !== fcmToken) setFcmToken(liveToken)
 
-      // capture session id
-      if (payload?.type === "session" && payload?.data?.session_id) {
-        setSessionId(payload.data.session_id)
-      }
+    // IMPORTANT: include customer_token because backend reads that for notify_customer()
+    const urlWithToken = await buildRunUrl({
+      scenario: scenarioText,
+      passenger_token: liveToken,
+      customer_token: liveToken,   // stays
+      driver_token: liveToken,     // optional: helpful for dual-notify paths
+    })
 
-      // auto rotate FCM token on UNREGISTERED
-      const err = payload?.data?.observation?.error
-      const errCode =
-        err?.errorCode ||
-        (typeof err === "object" &&
-        JSON.stringify(err).includes('"UNREGISTERED"')
-          ? "UNREGISTERED"
-          : null)
-      if (errCode === "UNREGISTERED") {
-        const newTok = await refreshFcmToken()
-        if (newTok) setFcmToken(newTok)
-      }
-
-      // show clarify panel
-      if (payload?.type === "clarify") {
-        setClarify(payload.data || null)
-        setStatus("awaiting")
-      }
-
-      setEvents((prev) => [...prev, payload])
-    } catch {
-      /* ignore non-JSON pings */
-    }
+    wireSSE(urlWithToken)
+  } catch (e) {
+    setStatus("error")
+    setError(e.message || "Failed to start stream")
   }
+}
 
-  const wireSSE = (url) => {
-    const es = new EventSource(url)
-    esRef.current = es
-    es.onmessage = (evt) => handleSSELine(evt.data)
-    es.onerror = () => {
-      setStatus("error")
-      setError("Stream error. Ensure backend is running, CORS allowed, and token is valid.")
-      closeStream()
-    }
+
+  // ✅ Send clarify answers to the dedicated backend endpoint
+// Replace your current resumeWithAnswer with this one
+const resumeWithAnswer = async (answerValue) => {
+  if (!sessionId) {
+    setError("Cannot resume: missing session id")
+    return
   }
+  closeStream()
+  setStatus("streaming")
 
-  const start = async () => {
-    if (!scenarioText) return
-    closeStream()
+  try {
+    const liveToken = fcmToken || (await ensureFreshFcmToken())
+    if (liveToken && liveToken !== fcmToken) setFcmToken(liveToken)
 
-    setActiveIndex(-1)
-    setIsPlaying(false)
-    setFollowLive(true)
-    setEvents([])
-    setRawLines([])
-    setError("")
+    const answers = {}
+    if (clarify?.question_id) answers[clarify.question_id] = answerValue
     setClarify(null)
-    setSessionId("")
-    setStatus("streaming")
+    setAnswerDraft("")
 
-    try {
-      const liveToken = fcmToken || (await ensureFreshFcmToken())
-      if (liveToken && liveToken !== fcmToken) setFcmToken(liveToken)
-
-      const urlWithToken = await buildRunUrl({
-        scenario: scenarioText,
-        passenger_token: liveToken || undefined,
-        customer_token: liveToken || undefined,
-      })
-
-      wireSSE(urlWithToken)
-    } catch (e) {
-      setStatus("error")
-      setError(e.message || "Failed to start stream")
+    const qs = new URLSearchParams()
+    qs.set("session_id", sessionId)              // backend accepts this to resume
+    qs.set("answers", JSON.stringify(answers))   // merge into hints.answers
+    if (liveToken) {
+      qs.set("passenger_token", liveToken)
+      qs.set("customer_token", liveToken)
     }
+
+    const url = `${API_BASE}/api/agent/run?${qs.toString()}`
+    wireSSE(url)
+  } catch (e) {
+    setStatus("error")
+    setError(e.message || "Failed to resume")
   }
+}
 
-  const resumeWithAnswer = async (answerValue) => {
-    if (!sessionId) return
-    closeStream()
-    setStatus("streaming")
 
-    try {
-      const liveToken = fcmToken || (await ensureFreshFcmToken())
-      if (liveToken && liveToken !== fcmToken) setFcmToken(liveToken)
-
-      const answers = {}
-      if (clarify?.question_id) {
-        answers[clarify.question_id] = answerValue
-      }
-      // clear current clarify box
-      setClarify(null)
-      setAnswerDraft("")
-
-      const url = await buildRunUrl({
-        session_id: sessionId,
-        answers: JSON.stringify(answers),
-        passenger_token: liveToken || undefined,
-        customer_token: liveToken || undefined,
-      })
-
-      wireSSE(url)
-    } catch (e) {
-      setStatus("error")
-      setError(e.message || "Failed to resume")
-    }
-  }
 
   const stop = () => {
     closeStream()
@@ -375,10 +424,10 @@ export default function AgentStream({ scenarioText }) {
   )
   const summaryEvt = useMemo(() => events.find((e) => e.type === "summary")?.data, [events])
 
-  // message-first summary (backend now sends data.message)
+  // message-first summary
   const summaryText = useMemo(() => {
     if (!summaryEvt) return ""
-    const msg = summaryEvt.message || summaryEvt.summary // fallback if older backend
+    const msg = summaryEvt.message || summaryEvt.summary
     if (msg && String(msg).trim()) return msg
 
     const kind = classification?.kind
@@ -420,11 +469,23 @@ export default function AgentStream({ scenarioText }) {
       </div>
       <div className="text-gray-200 mb-3">{clarify.question || "Please provide more info."}</div>
 
-      {/* Controls based on expected type */}
-      {clarify.expected === "boolean" ? (
+      {/* Prefer explicit options when provided */}
+      {Array.isArray(clarify.options) && clarify.options.length > 0 ? (
+        <div className="flex flex-wrap gap-2">
+          {clarify.options.map((opt) => (
+            <button key={opt} className="btn btn-primary" onClick={() => resumeWithAnswer(opt)}>
+              {String(opt)}
+            </button>
+          ))}
+        </div>
+      ) : clarify.expected === "boolean" ? (
         <div className="flex gap-2">
-          <button className="btn btn-primary" onClick={() => resumeWithAnswer("yes")}>Yes</button>
-          <button className="btn btn-ghost" onClick={() => resumeWithAnswer("no")}>No</button>
+          <button className="btn btn-primary" onClick={() => resumeWithAnswer("yes")}>
+            Yes
+          </button>
+          <button className="btn btn-ghost" onClick={() => resumeWithAnswer("no")}>
+            No
+          </button>
         </div>
       ) : (
         <div className="flex gap-2">
@@ -433,9 +494,13 @@ export default function AgentStream({ scenarioText }) {
             placeholder="Type your answer…"
             value={answerDraft}
             onChange={(e) => setAnswerDraft(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") resumeWithAnswer(answerDraft) }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") resumeWithAnswer(answerDraft)
+            }}
           />
-          <button className="btn btn-primary" onClick={() => resumeWithAnswer(answerDraft)}>Send</button>
+          <button className="btn btn-primary" onClick={() => resumeWithAnswer(answerDraft)}>
+            Send
+          </button>
         </div>
       )}
 
@@ -475,8 +540,14 @@ export default function AgentStream({ scenarioText }) {
             <Pill tone={classification.kind === "unknown" ? "warn" : "ok"}>{classification.kind}</Pill>
           </div>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-            <div><K>Severity</K><div className="font-medium">{classification.severity}</div></div>
-            <div><K>Uncertainty</K><div className="font-medium">{classification.uncertainty}</div></div>
+            <div>
+              <K>Severity</K>
+              <div className="font-medium">{classification.severity}</div>
+            </div>
+            <div>
+              <K>Uncertainty</K>
+              <div className="font-medium">{classification.uncertainty}</div>
+            </div>
           </div>
         </div>
       )}
@@ -499,15 +570,7 @@ export default function AgentStream({ scenarioText }) {
         <div className="card p-5">
           <div className="flex items-center justify-between mb-2">
             <div className="text-sm uppercase tracking-wider text-gray-400">Summary</div>
-            <Pill
-              tone={
-                summaryEvt.outcome === "resolved"
-                  ? "ok"
-                  : summaryEvt.outcome === "escalated"
-                  ? "warn"
-                  : "neutral"
-              }
-            >
+            <Pill tone={summaryEvt.outcome === "resolved" ? "ok" : summaryEvt.outcome === "escalated" ? "warn" : "neutral"}>
               {summaryEvt.outcome || "—"}
             </Pill>
           </div>
@@ -540,7 +603,9 @@ export default function AgentStream({ scenarioText }) {
         <button className="btn btn-primary" onClick={start} disabled={!scenarioText || status === "streaming"}>
           {status === "streaming" ? "Streaming…" : "Run Scenario"}
         </button>
-        <button className="btn btn-ghost" onClick={stop} disabled={status !== "streaming"}>Stop</button>
+        <button className="btn btn-ghost" onClick={stop} disabled={status !== "streaming"}>
+          Stop
+        </button>
         <div className="text-sm text-gray-400 self-center hidden md:block">
           API: <code className="font-mono">{previewUrl || "—"}</code>
         </div>

@@ -5,6 +5,18 @@ from typing import Any, Dict, List, Optional
 import requests
 from flask import Flask, request, jsonify, Response, g
 from flask_cors import CORS
+import uuid
+
+# In-memory store for clarification sessions
+CLARIFY_SESSIONS: Dict[str, Any] = {}
+
+def _normalize_answer(answer: Any, expected: str = "boolean"):
+    if expected == "boolean":
+        if isinstance(answer, bool):
+            return answer
+        s = str(answer).strip().lower()
+        return s in {"1", "true", "yes", "y", "ok"}
+    return answer
 
 # ----------------------------- LOGGING --------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -49,6 +61,62 @@ FCM_DRY_RUN              = get_cfg("FCM_DRY_RUN", "false").lower() == "true"
 
 if not GOOGLE_MAPS_API_KEY:
     raise RuntimeError("GOOGLE_MAPS_API_KEY missing in config.json or env")
+# ---- Dummy orders store (used for driver reroute) --------------------
+ORDERS_FILE = os.path.join(os.path.dirname(__file__), "orders.json")
+
+def _seed_orders_if_missing():
+    if os.path.exists(ORDERS_FILE):
+        return
+    seed = {
+        "orders": [
+            {
+                "id": "o1001",
+                "pickup":  {"lat": 12.9809, "lon": 80.2213, "address": "Taramani Link Rd, Velachery"},
+                "dropoff": {"lat": 12.9863, "lon": 80.2592, "address": "Besant Nagar Beach"},
+                "etaMinEstimate": 18,
+                "status": "pending"
+            },
+            {
+                "id": "o1002",
+                "pickup":  {"lat": 12.9922, "lon": 80.2450, "address": "Adyar Depot"},
+                "dropoff": {"lat": 13.0038, "lon": 80.2560, "address": "Indira Nagar"},
+                "etaMinEstimate": 15,
+                "status": "pending"
+            },
+            {
+                "id": "o1003",
+                "pickup":  {"lat": 12.9710, "lon": 80.2408, "address": "Velachery MRTS"},
+                "dropoff": {"lat": 12.9534, "lon": 80.2506, "address": "Thiruvanmiyur"},
+                "etaMinEstimate": 14,
+                "status": "pending"
+            },
+            {
+                "id": "o1004",
+                "pickup":  {"lat": 12.9119, "lon": 80.2244, "address": "OMR Sholinganallur"},
+                "dropoff": {"lat": 12.9205, "lon": 80.2273, "address": "Perungudi"},
+                "etaMinEstimate": 22,
+                "status": "pending"
+            },
+            {
+                "id": "o1005",
+                "pickup":  {"lat": 12.9846, "lon": 80.2345, "address": "Guindy"},
+                "dropoff": {"lat": 12.9991, "lon": 80.2568, "address": "Kasturibai Nagar"},
+                "etaMinEstimate": 16,
+                "status": "pending"
+            }
+        ]
+    }
+    with open(ORDERS_FILE, "w") as f:
+        json.dump(seed, f, indent=2)
+
+def _load_orders() -> Dict[str, Any]:
+    _seed_orders_if_missing()
+    with open(ORDERS_FILE, "r") as f:
+        return json.load(f)
+
+def _save_orders(data: Dict[str, Any]) -> None:
+    with open(ORDERS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
 # ----------------------------- LLM (Gemini) ----------------------------
 import google.generativeai as genai
@@ -219,27 +287,34 @@ def _truthy_str(v: Any) -> Optional[bool]:
     return None
 
 # -------------------------- HINT EXTRACTORS ---------------------------
+# -------------------------- HINT EXTRACTORS ---------------------------
 HINT_RE_ORIGIN = re.compile(r"origin\s*=\s*([0-9.+-]+)\s*,\s*([0-9.+-]+)", re.I)
 HINT_RE_DEST   = re.compile(r"dest\s*=\s*([0-9.+-]+)\s*,\s*([0-9.+-]+)", re.I)
-HINT_RE_ORIGIN_TEXT = re.compile(r"(?:^|[\s,;])origin(?:\s*[:=])\s*([^\n]+)", re.I)
-HINT_RE_DEST_TEXT   = re.compile(r"(?:^|[\s,;])dest(?:\s*[:=])\s*([^\n]+)", re.I)
-HINT_RE_FROM_TO     = re.compile(r"\bfrom\s+(.+?)\s+to\s+(.+?)(?:[,.]|$)", re.I)
 
 def extract_hints(scenario: str, driver_token: Optional[str], passenger_token: Optional[str]) -> Dict[str, Any]:
+    """
+    Build hints from the scenario.
+    - Accept numeric origin/dest if explicitly given (origin=lat,lon / dest=lat,lon).
+    - Always ask Gemini to infer origin_place/dest_place from the scenario text.
+    """
     hints: Dict[str, Any] = {}
+
+    # Numeric coordinates (optional)
     m1, m2 = HINT_RE_ORIGIN.search(scenario), HINT_RE_DEST.search(scenario)
     if m1 and m2:
         hints["origin"] = [float(m1.group(1)), float(m1.group(2))]
         hints["dest"]   = [float(m2.group(1)), float(m2.group(2))]
-    mt1, mt2 = HINT_RE_ORIGIN_TEXT.search(scenario), HINT_RE_DEST_TEXT.search(scenario)
-    if mt1: hints["origin_place"] = mt1.group(1).strip()
-    if mt2: hints["dest_place"]   = mt2.group(1).strip()
-    mt3 = HINT_RE_FROM_TO.search(scenario)
-    if mt3:
-        hints.setdefault("origin_place", mt3.group(1).strip())
-        hints.setdefault("dest_place",   mt3.group(2).strip())
-    if driver_token: hints["driver_token"] = driver_token
+
+    # Gemini-derived places
+    rd = _gemini_route_from_text(scenario)
+    if rd.get("origin_place"):
+        hints["origin_place"] = rd["origin_place"]
+    if rd.get("dest_place"):
+        hints["dest_place"] = rd["dest_place"]
+
+    if driver_token:    hints["driver_token"] = driver_token
     if passenger_token: hints["passenger_token"] = passenger_token
+    hints["scenario_text"] = scenario
     return hints
 
 # -------------------------- GOOGLE HELPERS ----------------------------
@@ -275,6 +350,19 @@ def _geocode(text: str) -> Optional[tuple[float, float]]:
         log.warning(f"[geocode] failed for '{text}': {e}")
         return None
 
+def _only_place_name(val: Any) -> Optional[str]:
+    """
+    Accept only human-readable place/address strings.
+    - Lists/tuples/dicts like [lat,lon] or {lat,lon} are ignored.
+    - Clean up whitespace; return None if blank.
+    """
+    if isinstance(val, str):
+        t = val.strip()
+        # discard "lat,lon" shape as a string too
+        if t and not re.match(r"^\s*-?\d+(\.\d+)?\s*,\s*-?\d+(\.\d+)?\s*$", t):
+            return t
+    return None
+
 # ----------------------------- REAL TOOLS ------------------------------
 def tool_geocode_place(query: str) -> Dict[str, Any]:
     pt = _geocode(query)
@@ -305,91 +393,295 @@ def _coerce_point(any_val: Any) -> Optional[List[float]]:
             return [pt[0], pt[1]]
     return None
 
-def tool_check_traffic(origin_any: Any, dest_any: Any, travel_mode: str = "DRIVE") -> Dict[str, Any]:
-    origin = _coerce_point(origin_any)
-    dest   = _coerce_point(dest_any)
-    if not origin or not dest:
-        return {"error": "invalid_coordinates_or_places"}
+def _coerce_point_or_place(val):
+    # Try to coerce lat/lon first
+    pt = _coerce_point(val)
+    if pt:
+        return {"lat": pt[0], "lon": pt[1]}
+    # Otherwise treat it as a place string
+    if isinstance(val, str) and val.strip():
+        return {"place_name": val.strip()}
+    return None
 
-    body = {
-        "origin": {"location": {"latLng": {"latitude": origin[0], "longitude": origin[1]}}},
-        "destination": {"location": {"latLng": {"latitude": dest[0], "longitude": dest[1]}}},
-        "travelMode": travel_mode,
-        "routingPreference": "TRAFFIC_AWARE_OPTIMAL",
-        "departureTime": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "computeAlternativeRoutes": False
-    }
-    field_mask = "routes.duration,routes.distanceMeters"
+
+def _gemini_route_from_text(scenario: str) -> Dict[str, Optional[str]]:
+    """
+    Ask Gemini to extract one origin and one destination place *name* from free text.
+    Returns {"origin_place": str|None, "dest_place": str|None}
+    """
+    prompt = f"""
+Extract exactly TWO concise place names from the scenario: the pickup/origin and the dropoff/destination.
+
+Return STRICT JSON only:
+{{
+  "origin_place": "<origin place name or empty if unknown>",
+  "dest_place": "<destination place name or empty if unknown>"
+}}
+
+Rules:
+- Prefer the most specific, human-readable names (street + area, mall name, etc.).
+- If only one place is mentioned, treat it as the destination and leave origin empty.
+- Do not include coordinates or extra punctuation.
+
+Scenario:
+{scenario}
+"""
     try:
-        data = _routes_post("directions/v2:computeRoutes", body, field_mask)
-        routes = data.get("routes") or []
-        if not routes:
-            raise ValueError("no_route")
-        r0 = routes[0]
-        eta_min = _seconds_to_minutes_str_dur(r0.get("duration", "0s"))
-        dist_km = (float(r0.get("distanceMeters", 0.0)) or 0.0) / 1000.0
-        baseline_min = (dist_km / BASELINE_SPEED_KMPH) * 60.0 if dist_km else 0.0
-        delay_min = max(0.0, round(eta_min - baseline_min, 1))
-        return {"etaMin": eta_min, "delayMin": delay_min, "distanceKm": round(dist_km, 2), "mode": travel_mode}
-    except Exception as e:
-        # Fallback approximation
-        dist_km = 0.0
-        try:
-            dist_km = round(haversine_km(origin[0], origin[1], dest[0], dest[1]), 3)
-        except Exception:
-            pass
-        eta_min = round((dist_km / BASELINE_SPEED_KMPH) * 60.0, 1) if dist_km else 0.0
-        return {"approximate": True, "reason": f"routes_failure:{str(e)}",
-                "distanceKm": round(dist_km, 2), "etaMin": eta_min, "delayMin": 0.0, "mode": travel_mode}
+        resp = _llm.generate_content(prompt)
+        text = getattr(resp, "text", "") or "{}"
+        data = safe_json(strip_json_block(text), {}) or {}
+        op = (data.get("origin_place") or "").strip() or None
+        dp = (data.get("dest_place") or "").strip() or None
+        return {"origin_place": op, "dest_place": dp}
+    except Exception:
+        return {"origin_place": None, "dest_place": None}
 
-def tool_calculate_alternative_route(origin_any: Any, dest_any: Any, travel_mode: str = "DRIVE") -> Dict[str, Any]:
-    origin = _coerce_point(origin_any)
-    dest   = _coerce_point(dest_any)
-    if not origin or not dest:
-        return {"error": "invalid_coordinates_or_places"}
+def _gemini_place_from_text(scenario: str) -> Optional[str]:
+    """
+    Extract ONE concise center place from free text (used to anchor 'nearby' searches).
+    """
+    prompt = f"""
+Extract ONE concise place name from the scenario that best represents the search center.
+Return STRICT JSON only:
+{{
+  "place_name": "<single place or empty>"
+}}
 
-    body = {
-        "origin": {"location": {"latLng": {"latitude": origin[0], "longitude": origin[1]}}},
-        "destination": {"location": {"latLng": {"latitude": dest[0], "longitude": dest[1]}}},
-        "travelMode": travel_mode,
-        "routingPreference": "TRAFFIC_AWARE_OPTIMAL",
-        "departureTime": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "computeAlternativeRoutes": True
-    }
-    field_mask = "routes.duration,routes.distanceMeters"
+Rules:
+- Prefer destination-like areas if present; else a prominent locality in the text.
+- Use human-readable names only (no coordinates/punctuation).
+
+Scenario:
+{scenario}
+"""
     try:
-        data = _routes_post("directions/v2:computeRoutes", body, field_mask)
-        routes = data.get("routes") or []
-        if not routes:
-            raise ValueError("no_routes")
-        out = []
-        for r in routes[:3]:
-            eta_min = _seconds_to_minutes_str_dur(r.get("duration", "0s"))
-            dist_km = (float(r.get("distanceMeters", 0.0)) or 0.0) / 1000.0
-            out.append({"etaMin": eta_min, "distanceKm": round(dist_km, 2)})
-        base = out[0]["etaMin"]
-        best = min(out, key=lambda x: x["etaMin"])
-        improvement = max(0.0, round(base - best["etaMin"], 1))
-        return {"routes": out, "best": best, "improvementMin": improvement, "mode": travel_mode}
+        resp = _llm.generate_content(prompt)
+        data = safe_json(strip_json_block(getattr(resp, "text", "") or "{}"), {}) or {}
+        name = (data.get("place_name") or "").strip()
+        return name or None
+    except Exception:
+        return None
+
+
+def _gemini_category_from_text(scenario: str) -> Optional[str]:
+    """
+    Map text to a coarse category used for Places searches.
+    Supported categories: mart, club, restaurant, pharmacy, hospital, atm, fuel, grocery
+    """
+    prompt = f"""
+From the scenario, pick ONE category keyword from this list:
+["mart","club","restaurant","pharmacy","hospital","atm","fuel","grocery"]
+Return STRICT JSON only:
+{{"category":"<one of the list or empty>"}}
+
+Scenario:
+{scenario}
+"""
+    try:
+        resp = _llm.generate_content(prompt)
+        data = safe_json(strip_json_block(getattr(resp, "text", "") or "{}"), {}) or {}
+        cat = (data.get("category") or "").strip().lower()
+        return cat or None
+    except Exception:
+        return None
+
+
+# Category→Places Primary Types and default keywords
+CATEGORY_TO_TYPES = {
+    "mart":       ["convenience_store", "supermarket"],
+    "grocery":    ["supermarket", "grocery_store"],
+    "club":       ["night_club"],
+    "restaurant": ["restaurant"],
+    "pharmacy":   ["pharmacy"],
+    "hospital":   ["hospital"],
+    "atm":        ["atm"],
+    "fuel":       ["gas_station"],
+}
+
+CATEGORY_KEYWORDS = {
+    "mart": "mart OR convenience store OR mini market",
+    "grocery": "grocery OR supermarket",
+    "club": "club OR night club",
+    "restaurant": "restaurant",
+    "pharmacy": "pharmacy medical store",
+    "hospital": "hospital",
+    "atm": "atm cash machine",
+    "fuel": "fuel station OR petrol pump OR gas station",
+}
+
+# --- place-only traffic tools ----------------------------------------------
+
+def _extract_places_from_text(text: str) -> tuple[Optional[str], Optional[str]]:
+    rd = _gemini_route_from_text(text or "")
+    return (rd.get("origin_place"), rd.get("dest_place"))
+
+def _directions_by_place(origin_place: str, dest_place: str, mode: str = "DRIVE", alternatives: bool = False):
+    url = "https://maps.googleapis.com/maps/api/directions/json"
+    params = {
+        "origin": origin_place,
+        "destination": dest_place,
+        "mode": mode.lower(),
+        "departure_time": "now",
+        "alternatives": "true" if alternatives else "false",
+        "key": GOOGLE_MAPS_API_KEY,
+    }
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+def tool_check_traffic(
+    origin_any: Optional[str] = None,
+    dest_any: Optional[str] = None,
+    travel_mode: str = "DRIVE",
+    scenario_text: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Traffic-aware ETA between two **place names** (no lat/lng required).
+    If origin/dest are missing or not plain names, extract them from scenario_text via Gemini.
+    """
+    try:
+        # Ensure we have clean place strings
+        o_name = _only_place_name(origin_any)
+        d_name = _only_place_name(dest_any)
+
+        if (not o_name or not d_name) and scenario_text:
+            gx_o, gx_d = _extract_places_from_text(scenario_text)
+            o_name = o_name or gx_o
+            d_name = d_name or gx_d
+
+        if not o_name or not d_name:
+            return {"error": "missing_place_names", "origin_place": o_name, "dest_place": d_name}
+
+        url = "https://maps.googleapis.com/maps/api/directions/json"
+        params = {
+            "origin": o_name,
+            "destination": d_name,
+            "mode": travel_mode.lower(),
+            "departure_time": "now",
+            "key": GOOGLE_MAPS_API_KEY,   # ✅ correct key
+        }
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
+
+        if data.get("status") != "OK":
+            return {
+                "error": "directions_failed",
+                "status": data.get("status"),
+                "origin_place": o_name,
+                "dest_place": d_name,
+                "raw": data,
+            }
+
+        leg = data["routes"][0]["legs"][0]
+        normal_sec = (leg.get("duration") or {}).get("value", 0)
+        traffic_sec = (leg.get("duration_in_traffic") or {}).get("value", normal_sec)
+        normal_min = normal_sec // 60
+        traffic_min = traffic_sec // 60
+        delay_min = max(0, traffic_min - normal_min)
+
+        return {
+            "status": "ok",
+            "origin_place": o_name,
+            "dest_place": d_name,
+            "normalMin": normal_min,
+            "trafficMin": traffic_min,
+            "delayMin": delay_min,               # <-- assertion delayMin>=0
+            "summary": data["routes"][0].get("summary"),
+        }
     except Exception as e:
-        # Approx fallback
-        try:
-            dist_km = round(haversine_km(origin[0], origin[1], dest[0], dest[1]), 3)
-        except Exception:
-            dist_km = 0.0
-        eta_min = round((dist_km / 30.0) * 60.0, 1) if dist_km else 0.0
-        return {"routes": [{"etaMin": eta_min, "distanceKm": round(dist_km, 2)}],
-                "best": {"etaMin": eta_min, "distanceKm": round(dist_km, 2)},
-                "improvementMin": 0.0, "approximate": True,
-                "reason": f"routes_failure:{str(e)}", "mode": travel_mode}
+        return {"error": f"traffic_check_failure:{e}"}
+
+
+def tool_calculate_alternative_route(
+    origin_any: Optional[str] = None,
+    dest_any: Optional[str] = None,
+    travel_mode: str = "DRIVE",
+    scenario_text: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Get alternate routes **by place names**; compute improvementMin (>=0).
+    improvementMin = (current traffic ETA) - (best traffic ETA among alternatives, including current).
+    """
+    try:
+        # Ensure we have clean place strings
+        o_name = _only_place_name(origin_any)
+        d_name = _only_place_name(dest_any)
+
+        if (not o_name or not d_name) and scenario_text:
+            gx_o, gx_d = _extract_places_from_text(scenario_text)
+            o_name = o_name or gx_o
+            d_name = d_name or gx_d
+
+        if not o_name or not d_name:
+            return {"error": "missing_place_names", "origin_place": o_name, "dest_place": d_name}
+
+        url = "https://maps.googleapis.com/maps/api/directions/json"
+        params = {
+            "origin": o_name,
+            "destination": d_name,
+            "mode": travel_mode.lower(),
+            "alternatives": "true",
+            "departure_time": "now",
+            "key": GOOGLE_MAPS_API_KEY,   # ✅ correct key
+        }
+        r = requests.get(url, params=params, timeout=20)
+        data = r.json()
+
+        if data.get("status") != "OK":
+            return {
+                "error": "directions_failed",
+                "status": data.get("status"),
+                "origin_place": o_name,
+                "dest_place": d_name,
+                "raw": data,
+            }
+
+        routes_out = []
+        best_traffic_min = None
+        current_traffic_min = None
+
+        for idx, route in enumerate(data.get("routes", [])):
+            leg = route["legs"][0]
+            normal_sec = (leg.get("duration") or {}).get("value", 0)
+            traffic_sec = (leg.get("duration_in_traffic") or {}).get("value", normal_sec)
+            normal_min = normal_sec // 60
+            traffic_min = traffic_sec // 60
+
+            if idx == 0:
+                current_traffic_min = traffic_min
+            if best_traffic_min is None or traffic_min < best_traffic_min:
+                best_traffic_min = traffic_min
+
+            routes_out.append({
+                "summary": route.get("summary"),
+                "durationMin": normal_min,
+                "trafficMin": traffic_min,
+            })
+
+        # Safety
+        if current_traffic_min is None or best_traffic_min is None:
+            improvement = 0
+        else:
+            improvement = max(0, current_traffic_min - best_traffic_min)
+
+        return {
+            "status": "ok",
+            "origin_place": o_name,
+            "dest_place": d_name,
+            "routes": routes_out,
+            "improvementMin": improvement,       # <-- assertion improvementMin>=0
+        }
+    except Exception as e:
+        return {"error": f"alt_route_failure:{e}"}
 
 def tool_compute_route_matrix(origins: List[Any], destinations: List[Any]) -> Dict[str, Any]:
     if not origins or not destinations:
         return {"error": "missing_origins_or_destinations"}
 
-    def wp_from_any(pt_any):
-        pt = _coerce_point(pt_any)
-        if not pt: raise ValueError("bad_point")
+    def wp_from_any(val):
+        pt = _coerce_point(val)  # strictly lat/lon list/tuple or geocoded string
+        if not pt:
+            raise ValueError("bad_point")
         return {"waypoint": {"location": {"latLng": {"latitude": pt[0], "longitude": pt[1]}}}}
 
     try:
@@ -401,26 +693,7 @@ def tool_compute_route_matrix(origins: List[Any], destinations: List[Any]) -> Di
         }
     except Exception:
         return {"error": "bad_points"}
-
-    field_mask = "originIndex,destinationIndex,duration,distanceMeters,status,condition"
-    url_path = "distanceMatrix/v2:computeRouteMatrix"
-    try:
-        data = _routes_post(url_path, body, field_mask)
-        out = []
-        for el in data:
-            eta_min = _seconds_to_minutes_str_dur(el.get("duration", "0s"))
-            dist_km = (float(el.get("distanceMeters", 0.0)) or 0.0) / 1000.0
-            out.append({
-                "originIndex": el.get("originIndex", 0),
-                "destinationIndex": el.get("destinationIndex", 0),
-                "etaMin": eta_min,
-                "distanceKm": round(dist_km, 2),
-                "condition": el.get("condition", "ROUTE_EXISTS"),
-                "status": el.get("status", {})
-            })
-        return {"elements": out[:5], "count": min(5, len(out))}
-    except Exception as e:
-        return {"error": f"route_matrix_failure:{str(e)}"}
+    ...
 
 def tool_check_weather(lat: float, lon: float) -> Dict[str, Any]:
     url = "https://weather.googleapis.com/v1/currentConditions:lookup"
@@ -464,32 +737,144 @@ def tool_pollen_forecast(lat: float, lon: float) -> Dict[str, Any]:
     except Exception as e:
         return {"error": f"pollen_failure:{str(e)}"}
 
-def tool_places_search_nearby(lat_any: Any, lon_any: Any, radius_m: int = 2000, keyword: Optional[str] = None, included_types: Optional[List[str]] = None) -> Dict[str, Any]:
-    pt = _coerce_point([lat_any, lon_any]) if not (isinstance(lat_any, (int,float)) and isinstance(lon_any, (int,float))) else [lat_any, lon_any]
-    if not pt: return {"error": "invalid_center"}
-    lat, lon = pt
+def tool_find_nearby_locker(place_name: str, radius_m: int = 1500) -> Dict[str, Any]:
+    """
+    Use Google Maps Places API to find nearby lockers given a destination place name.
+    """
+    try:
+        # Step 1: Geocode the place name into coordinates
+        geo_url = "https://maps.googleapis.com/maps/api/geocode/json"
+        geo_resp = requests.get(geo_url, params={"address": place_name, "key": GOOGLE_MAPS_API_KEY}).json()
 
+        if not geo_resp.get("results"):
+            return {"count": 0, "lockers": [], "error": "geocoding_failed"}
+
+        loc = geo_resp["results"][0]["geometry"]["location"]
+        lat, lon = loc["lat"], loc["lng"]
+
+        # Step 2: Search for nearby parcel lockers / package pickup points
+        places_url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+        query = "parcel locker OR package pickup OR amazon locker OR smart locker"
+        resp = requests.get(
+            places_url,
+            params={
+                "location": f"{lat},{lon}",
+                "radius": radius_m,
+                "keyword": query,
+                "key": GOOGLE_MAPS_API_KEY
+            }
+        ).json()
+
+        lockers = []
+        for p in resp.get("results", []):
+            lockers.append({
+                "id": p.get("place_id"),
+                "name": p.get("name"),
+                "address": p.get("vicinity"),
+                "location": p.get("geometry", {}).get("location", {}),
+                "rating": p.get("rating"),
+                "user_ratings_total": p.get("user_ratings_total"),
+            })
+
+        return {"count": len(lockers), "lockers": lockers}
+
+    except Exception as e:
+        return {"count": 0, "lockers": [], "error": str(e)}
+    
+def tool_places_search_nearby(
+    lat_any: Any = None,
+    lon_any: Any = None,
+    radius_m: int = 2000,
+    keyword: Optional[str] = None,
+    included_types: Optional[List[str]] = None,
+    place_name: Optional[str] = None,
+    scenario_text: Optional[str] = None,
+    category: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Find up to 5 nearby places relevant to a field/vertical.
+
+    Center priority:
+      1) place_name (geocoded)
+      2) scenario_text -> Gemini extract -> geocode
+      3) explicit lat/lon (or strings coercible via _coerce_point)
+
+    Category priority:
+      1) explicit category
+      2) scenario_text -> Gemini category guess
+      3) fallback: use provided keyword only
+    """
+    # --- Center selection ---
+    center = None
+
+    if place_name and str(place_name).strip():
+        pt = _geocode(place_name.strip())
+        if pt:
+            center = [pt[0], pt[1]]
+
+    if center is None and scenario_text and str(scenario_text).strip():
+        maybe_center_name = _gemini_place_from_text(scenario_text.strip())
+        if maybe_center_name:
+            pt = _geocode(maybe_center_name)
+            if pt:
+                center = [pt[0], pt[1]]
+
+    if center is None:
+        if isinstance(lat_any, (int, float)) and isinstance(lon_any, (int, float)):
+            center = [float(lat_any), float(lon_any)]
+        else:
+            center = _coerce_point([lat_any, lon_any]) if (lat_any is not None or lon_any is not None) else None
+
+    if not center:
+        return {"error": "invalid_center"}
+
+    # --- Category selection ---
+    cat = (category or "").strip().lower() if category else None
+    if not cat and scenario_text:
+        cat = _gemini_category_from_text(scenario_text)
+
+    types = included_types or (CATEGORY_TO_TYPES.get(cat) if cat else None)
+    kw = keyword or (CATEGORY_KEYWORDS.get(cat) if cat else None)
+
+    # - If we still have neither types nor keyword, default to a broad keyword
+    if not types and not kw:
+        kw = "point of interest"
+
+    lat, lon = center
     body = {
         "locationRestriction": {
             "circle": {
                 "center": {"latitude": lat, "longitude": lon},
-                "radius": float(radius_m)
+                "radius": float(radius_m),
             }
         }
     }
-    if keyword:
-        body["keyword"] = keyword
-    if included_types:
-        body["includedPrimaryTypes"] = included_types
+    if kw:
+        body["keyword"] = kw
+    if types:
+        body["includedPrimaryTypes"] = types
 
     field_mask = ",".join([
         "places.id","places.displayName","places.formattedAddress",
         "places.nationalPhoneNumber","places.websiteUri","places.rating",
         "places.userRatingCount","places.currentOpeningHours.openNow",
     ])
+
     try:
         data = _places_post("places:searchNearby", body, field_mask)
-        places = (data.get("places") or [])[:5]
+        raw = (data.get("places") or [])
+
+        # Keep top 5; prefer places with rating & more reviews
+        def _score(p):
+            rating = p.get("rating") or 0
+            cnt = p.get("userRatingCount") or 0
+            # simple rank: rating then log(review_count)
+            return (rating, math.log(cnt + 1))
+
+        # Sort descending by score
+        raw.sort(key=_score, reverse=True)
+        places = raw[:5]
+
         out = []
         for p in places:
             out.append({
@@ -500,9 +885,17 @@ def tool_places_search_nearby(lat_any: Any, lon_any: Any, radius_m: int = 2000, 
                 "website": p.get("websiteUri"),
                 "rating": p.get("rating"),
                 "userRatingCount": p.get("userRatingCount"),
-                "openNow": (((p.get("currentOpeningHours") or {}).get("openNow")) if p.get("currentOpeningHours") else None)
+                "openNow": (((p.get("currentOpeningHours") or {}).get("openNow"))
+                            if p.get("currentOpeningHours") else None),
             })
-        return {"count": len(out), "places": out}
+        return {
+            "count": len(out),
+            "places": out,
+            "center": {"lat": lat, "lon": lon},
+            "resolved_category": cat,
+            "used_types": types,
+            "used_keyword": kw,
+        }
     except Exception as e:
         return {"error": f"places_nearby_failure:{str(e)}"}
 
@@ -565,22 +958,40 @@ def _is_placeholder_token(token: str) -> bool:
     return (not t) or (t in {"token","customer_token","driver_token","passenger_token","str"})
 
 def _fcm_v1_send(token: str, title: str, body: str, data: Optional[dict] = None) -> Dict[str, Any]:
-    # Simulate/validate-only mode (dev)
+    # Dev mode: pretend delivered so UI flow can be tested
     if FCM_DRY_RUN:
         log.info("[tool_fcm_send] DRY_RUN on → simulating delivered")
         return {"delivered": True, "dryRun": True}
 
-    # Block missing/placeholder tokens
     if _is_placeholder_token(token):
         return {"delivered": False, "reason": "missing_or_placeholder_device_token"}
 
     access_token = _fcm_access_token()
     base = f"https://fcm.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/messages:send"
     headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-    msg = {"message": {"token": token, "notification": {"title": title, "body": body}}}
-    if data: msg["message"]["data"] = data
 
-    log.info(f"[tool_fcm_send] sending via FCM v1 title='{title}'")
+    # Use WebPush envelope for browsers
+    msg = {
+        "message": {
+            "token": token,
+            "webpush": {
+                "headers": {"Urgency": "high"},
+                "notification": {
+                    "title": title,
+                    "body": body,
+                    # icon & badge are optional but recommended
+                    # "icon": "https://your.cdn/icon-192.png",
+                    # "badge": "https://your.cdn/badge-72.png",
+                    "requireInteraction": True,
+                },
+                # Make the notification clickable (opens your app)
+                "fcmOptions": {"link": "https://your.app/alternates"},
+                "data": data or {},
+            },
+        }
+    }
+
+    log.info(f"[tool_fcm_send] sending WebPush title='{title}'")
     res = http_post(base, msg, headers, timeout=10)
     ok = bool(res) and (("name" in res) or res.get("ok") is True)
     if not ok:
@@ -594,6 +1005,107 @@ def tool_notify_passenger_and_driver(driver_token: Optional[str], passenger_toke
     d = _fcm_v1_send(driver_token or "", "Route Update", message) if driver_token else {"delivered": False}
     p = _fcm_v1_send(passenger_token or "", "Route Update", message) if passenger_token else {"delivered": False}
     return {"driverDelivered": d.get("delivered"), "passengerDelivered": p.get("delivered")}
+
+def tool_get_nearby_merchants(lat: float, lon: float, radius_m: int = 2000) -> Dict[str, Any]:
+    """
+    Use Google Places Nearby Search to get up to 5 restaurants near given coords.
+    """
+    try:
+        places_url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+        params = {
+            "location": f"{lat},{lon}",
+            "radius": radius_m,
+            "type": "restaurant",   # restrict to restaurants
+            "key": GOOGLE_MAPS_API_KEY,
+        }
+        resp = requests.get(places_url, params=params, timeout=15).json()
+
+        results = resp.get("results", [])
+        merchants = []
+        for p in results[:5]:
+            merchants.append({
+                "id": p.get("place_id"),
+                "name": p.get("name"),
+                "address": p.get("vicinity"),
+                "rating": p.get("rating"),
+                "user_ratings_total": p.get("user_ratings_total"),
+                "etaMin": None,   # you could later integrate Routes API to estimate ETA
+            })
+
+        return {"count": len(merchants), "merchants": merchants}
+
+    except Exception as e:
+        return {"count": 0, "merchants": [], "error": str(e)}
+    
+def _estimate_trip_minutes(pick_lat, pick_lon, drop_lat, drop_lon) -> float:
+    # simple baseline estimate using haversine + BASELINE_SPEED_KMPH
+    dist_km = haversine_km(pick_lat, pick_lon, drop_lat, drop_lon)
+    return round((dist_km / BASELINE_SPEED_KMPH) * 60.0, 1)
+
+def tool_assign_short_nearby_order(driver_id: str, driver_lat: float, driver_lon: float,
+                                   radius_km: float = 6.0, max_total_minutes: float = 25.0) -> Dict[str, Any]:
+    """
+    Pick the best 'quick' order near the driver:
+    - pickup within `radius_km`
+    - pickup->drop ETA <= `max_total_minutes`
+    Marks the order as 'assigned' to driver_id in orders.json.
+    """
+    data = _load_orders()
+    candidates = []
+    for o in data.get("orders", []):
+        if o.get("status") != "pending":
+            continue
+        p = o["pickup"]; d = o["dropoff"]
+        dist_to_pick = haversine_km(driver_lat, driver_lon, p["lat"], p["lon"])
+        if dist_to_pick > radius_km:
+            continue
+        job_minutes = _estimate_trip_minutes(p["lat"], p["lon"], d["lat"], d["lon"])
+        total_minutes = round(job_minutes + (dist_to_pick / BASELINE_SPEED_KMPH) * 60.0, 1)
+        if total_minutes <= max_total_minutes:
+            candidates.append({
+                "order": o, "distToPickupKm": round(dist_to_pick, 2),
+                "jobMinutes": job_minutes, "totalMinutes": total_minutes
+            })
+
+    if not candidates:
+        return {"assigned": False, "reason": "no_quick_orders_found"}
+
+    # choose the quickest total
+    best = min(candidates, key=lambda c: c["totalMinutes"])
+    # mark as assigned
+    for o in data["orders"]:
+        if o["id"] == best["order"]["id"]:
+            o["status"] = "assigned"
+            o["assignedTo"] = driver_id
+            break
+    _save_orders(data)
+
+    return {
+        "assigned": True,
+        "driver_id": driver_id,
+        "order": best["order"],
+        "distToPickupKm": best["distToPickupKm"],
+        "jobMinutes": best["jobMinutes"],
+        "totalMinutes": best["totalMinutes"]
+    }
+
+def tool_reroute_driver(driver_id: str, driver_lat: float, driver_lon: float) -> Dict[str, Any]:
+    """
+    Wrapper that calls assign_short_nearby_order and returns a friendly payload
+    used by the policy.
+    """
+    res = tool_assign_short_nearby_order(driver_id, driver_lat, driver_lon)
+    if not res.get("assigned"):
+        return {"driver_id": driver_id, "rerouted": False, "reason": res.get("reason")}
+    o = res["order"]
+    newtask = f"Pickup {o['id']} at {o['pickup']['address']} → drop at {o['dropoff']['address']} (≈{res['totalMinutes']} min)"
+    return {
+        "driver_id": driver_id,
+        "rerouted": True,
+        "newTask": newtask,
+        "assignment": res
+    }
+
 
 # ----------------------------- ASSERTIONS ------------------------------
 def check_assertion(assertion: Optional[str], observation: Dict[str, Any]) -> bool:
@@ -757,80 +1269,196 @@ def _policy_next_extended(kind: str, steps_done: int, hints: Dict[str, Any]) -> 
     """
     # Traffic
     if kind == "traffic":
-        origin = hints.get("origin") or hints.get("origin_place")
-        dest   = hints.get("dest")   or hints.get("dest_place")
-        mode   = (hints.get("mode") or "DRIVE").upper()
+        # we ignore coordinates; keep only human place strings
+        scen = hints.get("scenario_text") or ""
+        origin_any = hints.get("origin_place") or hints.get("origin")
+        dest_any   = hints.get("dest_place")   or hints.get("dest")
+        mode       = (hints.get("mode") or "DRIVE").upper()
 
-        # Ask for origin/destination if neither present (interactive)
-        if (not origin or not dest) and steps_done == 0:
+        origin_is_name = _only_place_name(origin_any) is not None
+        dest_is_name   = _only_place_name(dest_any)   is not None
+
+        # 0) ask once if we have neither name; tools can still infer from scenario_text later
+        if (not origin_is_name and not dest_is_name) and steps_done == 0:
             q = {
                 "question_id": "route_text",
-                "question": "Please provide origin and destination (e.g., 'origin=SRM, dest=Chennai airport').",
+                "question": (
+                    "Please provide pickup and drop as place names only, "
+                    "e.g. \"origin=SRMIST, dest=Chennai International Airport\"."
+                ),
                 "expected": "text",
             }
-            return ("ask for route","ask_user", q, None, "await_input", None, "Need origin/dest to proceed.")
+            return (
+                "ask for route",
+                "ask_user",
+                q,
+                None,
+                "await_input",
+                None,
+                "Need origin/destination names to proceed (or I'll infer from scenario).",
+            )
 
+        # 1) check congestion (place-name tools; will infer names from scenario_text if missing)
         if steps_done == 0:
-            return ("check congestion","check_traffic",
-                    {"origin_any": origin, "dest_any": dest, "travel_mode": mode},
-                    "delayMin>=0","continue",None,
-                    "Measure baseline ETA and traffic delay.")
+            return (
+                "check congestion",
+                "check_traffic",
+                {
+                    "origin_any": origin_any,
+                    "dest_any": dest_any,
+                    "travel_mode": mode,
+                    "scenario_text": scen,
+                },
+                "delayMin>=0",
+                "continue",
+                None,
+                "Measure baseline ETA and traffic delay."
+            )
+
+        # 2) compute alternatives (place-name tools)
         if steps_done == 1:
-            return ("reroute","calculate_alternative_route",
-                    {"origin_any": origin, "dest_any": dest, "travel_mode": mode},
-                    "improvementMin>=0","continue",None,
-                    "Compute alternatives and pick fastest.")
-        if steps_done == 2:
-            msg = "Rerouted to faster path; updated ETA shared."
-            return ("inform both","notify_passenger_and_driver",
-                    {"driver_token": hints.get("driver_token"),
-                     "passenger_token": hints.get("passenger_token"),
-                     "message": msg},
-                    "delivered==true","final","Reroute applied; passengers notified.",
-                    "Notify both parties.")
-        return None
+            return (
+                "reroute",
+                "calculate_alternative_route",
+                {
+                    "origin_any": origin_any,
+                    "dest_any": dest_any,
+                    "travel_mode": mode,
+                    "scenario_text": scen,
+                },
+                "improvementMin>=0",
+                "continue",
+                None,
+                "Compute alternatives and pick the fastest route."
+            )
 
+        # 3) notify both parties
+        if steps_done == 2:
+            msg = (
+                "Traffic ahead—switching to a faster route now. "
+                "ETA has been updated. Drive safe!"
+            )
+            return (
+                "inform both",
+                "notify_passenger_and_driver",
+                {
+                    "driver_token": hints.get("driver_token"),
+                    "passenger_token": hints.get("passenger_token"),
+                    "message": msg,
+                },
+                "delivered==true",
+                "final",
+                "Reroute applied; driver and passenger notified.",
+                "Notify both parties with the updated route/ETA."
+            )
+
+        return None
     # Merchant capacity
+    # Merchant capacity — notify → reroute → suggest alternates
+    # Merchant capacity — notify → real reroute → suggest alternates → push
     if kind == "merchant_capacity":
-        merchant_id = hints.get("merchant_id","merchant_demo")
-        latlon = hints.get("origin") or hints.get("dest")
+        token = hints.get("customer_token") or DEFAULT_CUSTOMER_TOKEN
+        driver_id = hints.get("driver_id", "driver_demo")
 
+        # Step 0: Proactively notify customer (real FCM)
         if steps_done == 0:
-            return ("check merchant status","get_merchant_status",
-                    {"merchant_id": merchant_id},
-                    None,"continue",None,
-                    "Check prep time and backlog.")
-
-        if (steps_done == 1) and (latlon is not None):
-            return ("suggest alt merchant","get_nearby_merchants",
-                    {"lat": latlon[0] if isinstance(latlon, list) else latlon, "lon": latlon[1] if isinstance(latlon, list) else latlon, "radius_m": 2000},
-                    "merchants>0","continue",None,
-                    "Suggest up to 5 nearby alternates.")
-        if (steps_done == 1) and (latlon is None):
-            token = hints.get("customer_token") or hints.get("passenger_token") or DEFAULT_CUSTOMER_TOKEN
             params = {
                 "fcm_token": token,
-                "message": "Merchant is overloaded; we’ll share alternatives shortly or re-assign.",
-                "voucher": True, "title":"Delay notice"
+                "message": "The restaurant is experiencing a long prep time (~40 min). We’re minimizing delays and will keep you updated. A small voucher has been applied for the inconvenience.",
+                "voucher": True,
+                "title": "Delay notice"
             }
             assertion = "delivered==true" if (token or FCM_DRY_RUN) else None
-            return ("notify","notify_customer", params, assertion, "final",
-                    "Customer informed (no coordinates available).",
-                    "No coordinates available to search alternatives; notify customer.")
+            return (
+                "notify customer about delay",
+                "notify_customer",
+                params,
+                assertion,
+                "continue",
+                None,
+                "Proactively inform customer and offer voucher."
+            )
 
+        # Step 1: Actually reroute the driver to a quick nearby order
+        if steps_done == 1:
+            # Try to infer current driver location: prefer origin (restaurant) then dest
+            latlon = None
+            if isinstance(hints.get("origin"), (list, tuple)) and len(hints["origin"]) == 2:
+                latlon = hints["origin"]
+            elif isinstance(hints.get("dest"), (list, tuple)) and len(hints["dest"]) == 2:
+                latlon = hints["dest"]
+
+            if latlon:
+                return (
+                    "reroute driver to quick nearby order",
+                    "reroute_driver",
+                    {"driver_id": driver_id, "driver_lat": float(latlon[0]), "driver_lon": float(latlon[1])},
+                    None,
+                    "continue",
+                    None,
+                    "Reduce driver idle time using orders.json."
+                )
+            # If we lack a reasonable location, skip reroute
+            return (
+                "skip reroute (no coords)",
+                "none",
+                {},
+                None,
+                "continue",
+                None,
+                "No driver location available; skipping reroute."
+            )
+
+        # Step 2: Suggest alternatives — real nearby restaurants via Places
         if steps_done == 2:
-            token = hints.get("customer_token") or hints.get("passenger_token") or DEFAULT_CUSTOMER_TOKEN
+            latlon = None
+            if isinstance(hints.get("origin"), (list, tuple)) and len(hints["origin"]) == 2:
+                latlon = hints["origin"]
+            elif isinstance(hints.get("dest"), (list, tuple)) and len(hints["dest"]) == 2:
+                latlon = hints["dest"]
+
+            if latlon:
+                return (
+                    "get nearby alternates",
+                    "get_nearby_merchants",
+                    {"lat": float(latlon[0]), "lon": float(latlon[1]), "radius_m": 2000},
+                    "merchants>0",
+                    "continue",
+                    None,
+                    "Fetch up to 5 similar nearby restaurants using Google Places."
+                )
+
+            # Finish if we cannot search
+            return (
+                "done (no coords)",
+                "none",
+                {},
+                None,
+                "final",
+                "Customer notified; driver rerouted. No location available to suggest alternates.",
+                "Cannot search alternates without a center."
+            )
+
+        # Step 3: Push notify with alternates (real FCM)
+        if steps_done == 3:
             params = {
                 "fcm_token": token,
-                "message": "Merchant is overloaded; sharing 3 nearby alternatives.",
-                "voucher": True, "title":"Delay notice"
+                "message": "We found a few nearby options with shorter prep times. We’ll switch to the fastest available unless you object.",
+                "voucher": True,
+                "title": "Alternatives available"
             }
             assertion = "delivered==true" if (token or FCM_DRY_RUN) else None
-            return ("notify","notify_customer", params, assertion, "final",
-                    "Customer informed; alternatives shared.",
-                    "Send push with voucher and alternatives.")
-        return None
+            return (
+                "notify customer with alternates",
+                "notify_customer",
+                params,
+                assertion,
+                "final",
+                "Customer informed; alternates shared.",
+                "Close loop with customer."
+            )
 
+        return None
     # Damage dispute
     if kind == "damage_dispute":
         order_id = hints.get("order_id","order_demo")
@@ -873,40 +1501,109 @@ def _policy_next_extended(kind: str, steps_done: int, hints: Dict[str, Any]) -> 
         answers = hints.get("answers") or {}
 
         if steps_done == 0:
-            rid = hints.get("recipient_id","recipient_demo")
-            return ("reach out via chat","contact_recipient_via_chat",
-                    {"recipient_id": rid, "message":"Driver has arrived. How should we proceed?"},
-                    "messagesent!=none","continue",None,"Start chat to coordinate.")
-        if steps_done == 1:
-            decision = _truthy_str(answers.get("safe_drop_ok"))
-            if decision is None:
-                q = {
-                    "question_id": "safe_drop_ok",
-                    "question": "Recipient unavailable. Is it okay to leave the package with the building concierge or a neighbor?",
-                    "expected": "boolean",
-                    "options": ["yes","no"]
-                }
-                return ("ask permission","ask_user", q,
-                        None, "await_input", None,
-                        "Need user's permission for safe drop.")
-            if decision is True:
-                addr = hints.get("dest_place") or "Building concierge"
-                return ("suggest safe drop","suggest_safe_drop_off",{"address": addr},
-                        "suggested==true","final","Proposed safe drop-off at concierge; awaiting confirmation in app.",
-                        "Offer safe drop.")
-            latlon = hints.get("dest") or hints.get("origin")
-            if latlon:
-                return ("find locker","find_nearby_locker",
-                        {"lat": latlon[0], "lon": latlon[1], "radius_m": 1200},
-                        "lockers>0","final","Suggested nearest parcel locker as fallback.",
-                        "Provide locker fallback.")
-            return ("notify","notify_customer",
-                    {"fcm_token": hints.get("customer_token") or DEFAULT_CUSTOMER_TOKEN,
-                     "message":"Delivery attempted; please advise next steps in the app.",
-                     "voucher": False, "title":"Delivery attempt"},
-                    "delivered==true","final","Awaiting recipient guidance.",
-                    "No coordinates for lockers; notify customer.")
-        return None
+            rid = hints.get("recipient_id", "recipient_demo")
+            return (
+                "reach out via chat",
+                "contact_recipient_via_chat",
+                {"recipient_id": rid, "message": "Driver has arrived. How should we proceed?"},
+                "messagesent!=none",
+                "continue",
+                None,
+                "Start chat to coordinate.",
+            )
+
+        # --- Safe drop check ---
+        safe_ok = _truthy_str(answers.get("safe_drop_ok"))
+        if safe_ok is None:
+            q = {
+                "question_id": "safe_drop_ok",
+                "question": "Recipient unavailable. Is it okay to leave the package with the building concierge or a neighbor?",
+                "expected": "boolean",
+                "options": ["yes", "no"],
+            }
+            return (
+                "clarify",
+                "none",
+                q,
+                None,
+                "await_input",
+                "Awaiting input: Recipient unavailable. Is it okay to leave the package with the building concierge or a neighbor?",
+                "Ask for safe-drop permission.",
+            )
+
+        if safe_ok is True:
+            addr = hints.get("dest_place") or "Building concierge"
+            return (
+                "suggest safe drop",
+                "suggest_safe_drop_off",
+                {"address": addr},
+                "suggested==true",
+                "final",
+                "Safe drop approved; driver will leave package with concierge.",
+                "Proceed with safe drop.",
+            )
+
+        # --- Locker fallback if safe drop not allowed ---
+        locker_ok = _truthy_str(answers.get("locker_ok"))
+        if locker_ok is None:
+            q = {
+                "question_id": "locker_ok",
+                "question": "Safe drop not allowed. Should I route to the nearest secure parcel locker instead?",
+                "expected": "boolean",
+                "options": ["yes", "no"],
+            }
+            return (
+                "clarify",
+                "none",
+                q,
+                None,
+                "await_input",
+                "Awaiting input: Safe drop not allowed. Route to a nearby locker?",
+                "Offer locker fallback.",
+            )
+
+        # --- Try lockers first (regardless of yes/no), then notify if we can't search ---
+        dest_place = hints.get("dest_place")
+        if dest_place:
+            # Use place name → our locker finder (Google Places under the hood)
+            return (
+                "find locker",
+                "find_nearby_locker",
+                {"place_name": dest_place, "radius_m": 1500},
+                "lockers>0",
+                "final",
+                "Suggested nearest parcel locker from Google Maps.",
+                "Provide locker fallback.",
+            )
+
+        # If no place name, but we have coordinates → fall back to Places Nearby with locker keyword
+        latlon = hints.get("dest") or hints.get("origin")
+        if latlon and isinstance(latlon, (list, tuple)) and len(latlon) == 2:
+            return (
+                "find locker (coords)",
+                "places_search_nearby",
+                {"lat": latlon[0], "lon": latlon[1], "radius_m": 1500, "keyword": "parcel locker OR package pickup OR amazon locker OR smart locker"},
+                "count>0",
+                "final",
+                "Suggested nearest parcel locker based on current location.",
+                "Fallback locker search by coordinates.",
+            )
+
+        # If we cannot search lockers at all → notify customer
+        return (
+            "notify",
+            "notify_customer",
+            {
+                "fcm_token": hints.get("customer_token") or DEFAULT_CUSTOMER_TOKEN,
+                "message": "Delivery attempted; no safe drop, and no lockers could be suggested. Please advise next steps.",
+                "voucher": False,
+                "title": "Delivery attempt",
+            },
+            "delivered==true",
+            "final",
+            "Awaiting recipient guidance (no place/coords available to search lockers).",
+            "Notify customer due to insufficient location data.",
+        )
 
     # Unknown/other kinds: stop after classification
     return None
@@ -970,8 +1667,7 @@ class SynapseAgent:
         last_final_message = None
         awaiting_q: Optional[Dict[str, Any]] = None
 
-        # If user provided a free-text route in answers, fold it back into scenario/hints
-        # (for traffic clarify flow)
+        # If user provided a free-text route in answers, fold it back (traffic clarify flow)
         answers = hints.get("answers") or {}
         route_text = (answers.get("route_text") or "").strip() if isinstance(answers.get("route_text"), str) else ""
         if route_text and ("origin" not in hints and "origin_place" not in hints):
@@ -1027,6 +1723,7 @@ class SynapseAgent:
                 break
 
             if finish_reason == "await_input":
+                # save the current run under the SAME sid for resume
                 _session_save(sid, {
                     "scenario": scenario,
                     "hints": hints,
@@ -1044,16 +1741,18 @@ class SynapseAgent:
                 yield {"type": "clarify", "at": now_iso(), "data": awaiting_q, "kind": kind}
                 break
 
-        # 3) summary (always include a message)
-        duration = int(time.time() - t0)
-        outcome = "resolved" if (last_final_message is not None) else ("await_input" if awaiting_q else ("classified_only" if steps == 0 else "incomplete"))
-        summary_message = (
-            last_final_message
-            or (f"Awaiting input: {awaiting_q['question']}" if awaiting_q else "No further steps were taken.")
-        )
+                # 3) summary
+        # If we're awaiting user input, do NOT emit a summary yet.
+        if awaiting_q:
+            # keep session for resume; the route wrapper will still send [DONE]
+            return
 
-        if outcome != "await_input":
-            _session_delete(sid)
+        duration = int(time.time() - t0)
+        outcome = "resolved" if (last_final_message is not None) else ("classified_only" if steps == 0 else "incomplete")
+        summary_message = last_final_message or "No further steps were taken."
+
+        # we're done; clear session
+        _session_delete(sid)
 
         yield {
             "type": "summary",
@@ -1078,13 +1777,13 @@ class SynapseAgent:
 TOOLS: Dict[str, Dict[str, Any]] = {
     "check_traffic": {
         "fn": tool_check_traffic,
-        "desc": "ETA/naive delay via Routes API (accepts coords or place text).",
-        "schema": {"origin_any": "str|[lat,lon]", "dest_any": "str|[lat,lon]", "travel_mode": "DRIVE|TWO_WHEELER|WALK|BICYCLE|TRANSIT"},
+        "desc": "ETA/naive delay via Routes API (place-name based).",
+        "schema": {"origin_any": "str?", "dest_any": "str?", "travel_mode": "DRIVE|TWO_WHEELER|WALK|BICYCLE|TRANSIT", "scenario_text": "str?"},
     },
     "calculate_alternative_route": {
         "fn": tool_calculate_alternative_route,
-        "desc": "Alternative routes & improvement (Routes API).",
-        "schema": {"origin_any": "str|[lat,lon]", "dest_any": "str|[lat,lon]", "travel_mode": "str"},
+        "desc": "Alternative routes & improvement (place-name based).",
+        "schema": {"origin_any": "str?", "dest_any": "str?", "travel_mode": "str", "scenario_text": "str?"},
     },
     "compute_route_matrix": {
         "fn": tool_compute_route_matrix,
@@ -1112,9 +1811,18 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "schema": {"lat": "float", "lon": "float", "timestamp": "int?"},
     },
     "places_search_nearby": {
-        "fn": tool_places_search_nearby,
-        "desc": "Nearby places (Places API).",
-        "schema": {"lat": "float|str", "lon": "float|str", "radius_m": "int", "keyword": "str?", "included_types": "list[str]?"},
+    "fn": tool_places_search_nearby,
+    "desc": "Nearby places (category-aware, Places API).",
+    "schema": {
+        "lat": "float|str?",
+        "lon": "float|str?",
+        "radius_m": "int",
+        "keyword": "str?",
+        "included_types": "list[str]?",
+        "place_name": "str?",
+        "scenario_text": "str?",
+        "category": "str?"
+    },
     },
     "place_details": {
         "fn": tool_place_details,
@@ -1145,17 +1853,22 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     # --- Custom tools / mocks ---
     "get_merchant_status": {"fn": lambda merchant_id: {"merchant_id": merchant_id, "prepTimeMin": 40, "backlogOrders": 12, "response": True},
                             "desc": "Merchant backlog/prep time.", "schema": {"merchant_id":"str"}},
-    "reroute_driver": {"fn": lambda driver_id, new_task: {"driver_id": driver_id, "rerouted": True, "newTask": new_task},
-                       "desc": "Reassign driver.", "schema": {"driver_id":"str","new_task":"str"}},
-    "get_nearby_merchants": {"fn": lambda lat, lon, radius_m=2000: {
-        "count": 5, "merchants": [
-            {"id": "m1", "name": "Alt Restaurant A", "etaMin": 15},
-            {"id": "m2", "name": "Alt Restaurant B", "etaMin": 20},
-            {"id": "m3", "name": "Alt Restaurant C", "etaMin": 25},
-            {"id": "m4", "name": "Alt Restaurant D", "etaMin": 18},
-            {"id": "m5", "name": "Alt Restaurant E", "etaMin": 22},
-        ]},
-        "desc": "Nearby alternate restaurants (≤5).", "schema": {"lat":"float","lon":"float","radius_m":"int"}},
+    "assign_short_nearby_order": {
+        "fn": tool_assign_short_nearby_order,
+        "desc": "Assign a quick nearby order from orders.json",
+        "schema": {"driver_id": "str", "driver_lat": "float", "driver_lon": "float", "radius_km": "float?", "max_total_minutes": "float?"},
+    },
+    "reroute_driver": {
+        "fn": tool_reroute_driver,
+        "desc": "Reroute driver to a selected short nearby order",
+        "schema": {"driver_id": "str", "driver_lat": "float", "driver_lon": "float"},
+    },
+
+    "get_nearby_merchants": {
+        "fn": tool_get_nearby_merchants,
+        "desc": "Nearby alternate restaurants via Google Places.",
+        "schema": {"lat": "float", "lon": "float", "radius_m": "int"},
+    },
     "initiate_mediation_flow": {"fn": lambda order_id: {"order_id": order_id, "flow": "started"},
                                 "desc": "Start mediation flow.", "schema": {"order_id":"str"}},
     "collect_evidence": {"fn": lambda order_id: {"order_id": order_id, "photos": 2, "questionnaireCompleted": True},
@@ -1172,13 +1885,8 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                                    "desc": "Chat recipient.", "schema": {"recipient_id":"str","message":"str"}},
     "suggest_safe_drop_off": {"fn": lambda address: {"address": address, "suggested": True},
                               "desc": "Suggest safe place.", "schema": {"address":"str"}},
-    "find_nearby_locker": {"fn": lambda lat, lon, radius_m=1000: {
-        "count": 3, "lockers": [
-            {"id": "l1", "location": "Locker A", "distanceM": 300},
-            {"id": "l2", "location": "Locker B", "distanceM": 700},
-            {"id": "l3", "location": "Locker C", "distanceM": 950},
-        ]},
-        "desc": "Suggest parcel locker (≤5).", "schema": {"lat":"float","lon":"float","radius_m":"int"}},
+    "find_nearby_locker": {
+    "fn": lambda place_name, radius_m=1500: tool_find_nearby_locker(place_name, radius_m)},
     "check_flight_status": {"fn": lambda flight_no: {"flight": flight_no, "status": "DELAYED", "delayMin": 45},
                             "desc": "Flight status check.", "schema": {"flight_no":"str"}},
 
@@ -1191,6 +1899,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
 }
 
 # ----------------------------- FLASK APP -------------------------------
+_seed_orders_if_missing()
 app = Flask(__name__)
 CORS(app, origins=CORS_ORIGINS if CORS_ORIGINS != ["*"] else "*", supports_credentials=True)
 agent = SynapseAgent(_llm)
@@ -1223,7 +1932,8 @@ def run_stream():
     GET /api/agent/run  (SSE)
     First run:
       - scenario: the scenario text
-      - (optional) origin, dest, origin_place, dest_place, tokens, etc.
+      - (optional) origin, dest (numeric "lat,lon")
+      - (optional) driver_token, passenger_token, merchant_id, order_id, driver_id, recipient_id
       - (optional) answers: JSON string to seed answers
     Resume:
       - session_id: id from a previous run where we emitted "clarify"
@@ -1248,8 +1958,12 @@ def run_stream():
         # Allow token overrides on resume
         driver_token_q    = (request.args.get("driver_token") or "").strip()
         passenger_token_q = (request.args.get("passenger_token") or "").strip()
+        customer_token_q  = (request.args.get("customer_token") or "").strip()  # <-- add
+
         if driver_token_q:    hints["driver_token"] = driver_token_q
         if passenger_token_q: hints["passenger_token"] = passenger_token_q
+        if customer_token_q:  hints["customer_token"] = customer_token_q        # <-- add
+
 
         def generate():
             try:
@@ -1284,9 +1998,7 @@ def run_stream():
 
     driver_token_q    = (request.args.get("driver_token") or "").strip()
     passenger_token_q = (request.args.get("passenger_token") or "").strip()
-
-    origin_place_q  = request.args.get("origin_place")
-    dest_place_q    = request.args.get("dest_place")
+    customer_token_q  = (request.args.get("customer_token") or "").strip()
 
     merchant_id_q  = (request.args.get("merchant_id") or "").strip()
     order_id_q     = (request.args.get("order_id") or "").strip()
@@ -1296,13 +2008,17 @@ def run_stream():
     # Append human-readable hints (avoid leaking raw tokens)
     if origin_q and dest_q:
         scenario += f"\n\n(Hint: origin={origin_q}, dest={dest_q})"
-    if origin_place_q and dest_place_q:
-        scenario += f"\n\n(Hint: origin_place={origin_place_q}, dest_place={dest_place_q})"
-    if driver_token_q or passenger_token_q:
-        scenario += f"\n\n(Hint: driver_token={'…' if driver_token_q else 'none'}, passenger_token={'…' if passenger_token_q else 'none'})"
+    if driver_token_q or passenger_token_q or customer_token_q:
+        scenario += (
+            "\n\n(Hint: driver_token="
+            f"{'…' if driver_token_q else 'none'}, passenger_token="
+            f"{'…' if passenger_token_q else 'none'}, customer_token="
+            f"{'…' if customer_token_q else 'none'})"
+        )
     if merchant_id_q or order_id_q or driver_id_q or recipient_id_q:
         scenario += f"\n\n(Hint: merchant_id={merchant_id_q or '—'}, order_id={order_id_q or '—'}, driver_id={driver_id_q or '—'}, recipient_id={recipient_id_q or '—'})"
 
+    # Build base hints (Gemini will infer origin/dest places inside extract_hints)
     hints = extract_hints(scenario, driver_token_q, passenger_token_q)
 
     # Override from query params if provided (coordinates)
@@ -1315,17 +2031,13 @@ def run_stream():
         except Exception:
             pass
 
-    # Place hints
-    if origin_place_q:
-        hints["origin_place"] = origin_place_q
-    if dest_place_q:
-        hints["dest_place"]   = dest_place_q
-
     # Token hints
     if driver_token_q:
         hints["driver_token"] = driver_token_q
     if passenger_token_q:
         hints["passenger_token"] = passenger_token_q
+    if customer_token_q:
+        hints["customer_token"] = customer_token_q
     hints.setdefault("driver_token", DEFAULT_DRIVER_TOKEN or None)
     hints.setdefault("passenger_token", DEFAULT_PASSENGER_TOKEN or None)
     hints.setdefault("customer_token", DEFAULT_CUSTOMER_TOKEN or None)
@@ -1336,7 +2048,7 @@ def run_stream():
     if driver_id_q:    hints["driver_id"]    = driver_id_q
     if recipient_id_q: hints["recipient_id"] = recipient_id_q
 
-    # Geocode with Google if coords still missing (based on place names)
+    # If Gemini inferred origin/dest *place names*, geocode to coords when coords missing
     if not hints.get("origin") and hints.get("origin_place"):
         pt = _geocode(hints["origin_place"])
         if pt: hints["origin"] = [pt[0], pt[1]]
@@ -1369,7 +2081,12 @@ def run_stream():
 def resolve_sync_endpoint():
     """
     POST /api/agent/resolve
-    Body: { scenario?, session_id?, answers?, origin:[lat,lon]?, dest:[lat,lon]?, origin_place?, dest_place?, driver_token?, passenger_token?, merchant_id?, order_id?, driver_id?, recipient_id? }
+    Body: {
+      scenario?, session_id?, answers?,
+      origin:[lat,lon]?, dest:[lat,lon]?,
+      driver_token?, passenger_token?,
+      merchant_id?, order_id?, driver_id?, recipient_id?
+    }
     Returns: { trace: [ classification, step..., summary ] }
     """
     data = request.get_json(force=True) or {}
@@ -1394,39 +2111,32 @@ def resolve_sync_endpoint():
 
     driver_token = (data.get("driver_token") or "").strip()
     passenger_token = (data.get("passenger_token") or "").strip()
+    customer_token   = (data.get("customer_token") or "").strip()
 
     origin = data.get("origin")  # [lat,lon]
     dest   = data.get("dest")    # [lat,lon]
-    origin_place = data.get("origin_place")
-    dest_place   = data.get("dest_place")
 
     merchant_id  = (data.get("merchant_id") or "").strip()
     order_id     = (data.get("order_id") or "").strip()
     driver_id    = (data.get("driver_id") or "").strip()
     recipient_id = (data.get("recipient_id") or "").strip()
 
-    # Geocode if missing
-    if (not origin or not dest):
-        if not origin and origin_place:
-            pt = _geocode(origin_place)
-            if pt: origin = [pt[0], pt[1]]
-        if not dest and dest_place:
-            pt = _geocode(dest_place)
-            if pt: dest = [pt[0], pt[1]]
-
-    # Embed hints text
+    # Embed hints text for numeric coords only
     if origin and dest:
         scenario += f"\n\n(Hint: origin={origin[0]},{origin[1]}, dest={dest[0]},{dest[1]})"
-    if origin_place or dest_place:
-        scenario += f"\n\n(Hint: origin_place={origin_place or '—'}, dest_place={dest_place or '—'})"
     if merchant_id or order_id or driver_id or recipient_id:
-        scenario += f"\n\n(Hint: merchant_id={merchant_id or '—'}, order_id={order_id or '—'}, driver_id={driver_id or '—'}, recipient_id={recipient_id or '—'})"
-
+         scenario += f"\n\n(Hint: merchant_id={merchant_id or '—'}, order_id={order_id or '—'}, driver_id={driver_id or '—'}, recipient_id={recipient_id or '—'})"
+    if driver_token or passenger_token or customer_token:
+        scenario += (
+            "\n\n(Hint: driver_token="
+            f"{'…' if driver_token else 'none'}, passenger_token="
+            f"{'…' if passenger_token else 'none'}, customer_token="
+            f"{'…' if customer_token else 'none'})"
+        )
+    # Base hints
     hints: Dict[str, Any] = {"origin": origin, "dest": dest}
     if driver_token:    hints["driver_token"]    = driver_token
     if passenger_token: hints["passenger_token"] = passenger_token
-    if origin_place:    hints["origin_place"]    = origin_place
-    if dest_place:      hints["dest_place"]      = dest_place
     if merchant_id:     hints["merchant_id"]     = merchant_id
     if order_id:        hints["order_id"]        = order_id
     if driver_id:       hints["driver_id"]       = driver_id
@@ -1434,6 +2144,17 @@ def resolve_sync_endpoint():
     hints.setdefault("driver_token", DEFAULT_DRIVER_TOKEN or None)
     hints.setdefault("passenger_token", DEFAULT_PASSENGER_TOKEN or None)
     hints.setdefault("customer_token", DEFAULT_CUSTOMER_TOKEN or None)
+
+    # Let Gemini infer origin/dest *place names*; then geocode if coords are missing
+    h2 = extract_hints(scenario, hints.get("driver_token"), hints.get("passenger_token"))
+    hints.update({k: v for k, v in h2.items() if v})
+
+    if not hints.get("origin") and hints.get("origin_place"):
+        pt = _geocode(hints["origin_place"])
+        if pt: hints["origin"] = [pt[0], pt[1]]
+    if not hints.get("dest") and hints.get("dest_place"):
+        pt = _geocode(hints["dest_place"])
+        if pt: hints["dest"] = [pt[0], pt[1]]
 
     _merge_answers(hints, answers)
 
@@ -1470,6 +2191,55 @@ def fcm_send():
         return jsonify({"error":"missing token"}), 400
     res = _fcm_v1_send(token, title, body, extra)
     return jsonify(res)
+
+@app.route("/api/agent/clarify/continue")
+@require_auth
+def clarify_continue_stream():
+    sid = (request.args.get("session_id") or "").strip()
+    qid = (request.args.get("question_id") or "").strip()
+    expected = (request.args.get("expected") or "boolean").strip()
+    ans_raw = request.args.get("answer", "")
+
+    if not sid or not qid:
+        return jsonify({"error": "missing session_id or question_id"}), 400
+
+    sess = _session_load(sid)
+    if not sess:
+        return jsonify({"error": "invalid_or_expired_session"}), 404
+
+    scenario = sess["scenario"]
+    hints = dict(sess.get("hints") or {})
+    start_at = int(sess.get("steps_done", 0))
+
+    # normalize answer and merge
+    def _norm(val, exp):
+        v = str(val).strip().lower()
+        if exp == "boolean":
+            return v in {"yes","y","true","1"}
+        return val
+    ans = _norm(ans_raw, expected)
+
+    answers = dict(hints.get("answers") or {})
+    answers[qid] = ans
+    hints["answers"] = answers
+
+    def generate():
+        try:
+            for evt in agent.resolve_stream(scenario, hints=hints, session_id=sid, start_at_step=start_at, resume=True):
+                yield sse(evt)
+            yield sse("[DONE]")
+        except Exception as e:
+            yield sse({"type":"error","at":now_iso(),"data":{"message":str(e),"trace":traceback.format_exc()}})
+            yield sse("[DONE]")
+
+    headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return Response(generate(), headers=headers)
+
 
 if __name__ == "__main__":
     # Run: python app.py
