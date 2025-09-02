@@ -1,5 +1,6 @@
 # Ignore config files with secrets
 synapseFlask/config.json
+synapse-frontend/src/config.js 
 synapseFlask\synapse-54cfb-firebase-adminsdk-fbsvc-6d63c78be8.json
 # Optional: also ignore service account JSONs
 *.json
