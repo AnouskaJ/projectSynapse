@@ -1,5 +1,6 @@
 # app.py
 import datetime
+import datetime
 import os, re, json, time, math, traceback, logging
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -7,6 +8,8 @@ import requests
 from flask import Flask, request, jsonify, Response, g, session
 from flask_cors import CORS
 import uuid
+
+import urllib
 
 import urllib
 
@@ -380,6 +383,7 @@ import base64, mimetypes, time
 from uuid import uuid4
 
 UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")  
+UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")  
 
 def _ensure_upload_dir():
     os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -436,6 +440,7 @@ def tool_analyze_evidence(order_id: str, images=None, notes=None):
     prompt = (
         "Analyze these spilled package photos and if the package looks spilled then suggest refund_reasonable as true, else false with rationale.\n"
         "Mostly favour a rfund if the package is open/spilled.\n"
+        "Mostly favour a rfund if the package is open/spilled.\n"
         "Return ONLY valid JSON like:\n"
         "{\n"
         '  "fault": "merchant|driver|unclear",\n'
@@ -448,6 +453,7 @@ def tool_analyze_evidence(order_id: str, images=None, notes=None):
 
     try:
         resp = _llm.generate_content(
+        contents=[prompt] + parts 
         contents=[prompt] + parts 
     )
         raw = getattr(resp, "text", "") or ""
@@ -509,7 +515,13 @@ def _gemini_route_from_text(scenario: str) -> Dict[str, Optional[str]]:
     """
     prompt = f"""
         Extract exactly TWO concise place names from the scenario: the pickup/origin and the dropoff/destination.
+        Extract exactly TWO concise place names from the scenario: the pickup/origin and the dropoff/destination.
 
+        Return STRICT JSON only:
+        {{
+        "origin_place": "<origin place name or empty if unknown>",
+        "dest_place": "<destination place name or empty if unknown>"
+        }}
         Return STRICT JSON only:
         {{
         "origin_place": "<origin place name or empty if unknown>",
@@ -520,7 +532,14 @@ def _gemini_route_from_text(scenario: str) -> Dict[str, Optional[str]]:
         - Prefer the most specific, human-readable names (street + area, mall name, etc.).
         - If only one place is mentioned, treat it as the destination and leave origin empty.
         - Do not include coordinates or extra punctuation.
+        Rules:
+        - Prefer the most specific, human-readable names (street + area, mall name, etc.).
+        - If only one place is mentioned, treat it as the destination and leave origin empty.
+        - Do not include coordinates or extra punctuation.
 
+        Scenario:
+        {scenario}
+        """
         Scenario:
         {scenario}
         """
@@ -544,11 +563,22 @@ def _gemini_place_from_text(scenario: str) -> Optional[str]:
         {{
         "place_name": "<single place or empty>"
         }}
+        Extract ONE concise place name from the scenario that best represents the search center.
+        Return STRICT JSON only:
+        {{
+        "place_name": "<single place or empty>"
+        }}
 
         Rules:
         - Prefer destination-like areas if present; else a prominent locality in the text.
         - Use human-readable names only (no coordinates/punctuation).
+        Rules:
+        - Prefer destination-like areas if present; else a prominent locality in the text.
+        - Use human-readable names only (no coordinates/punctuation).
 
+        Scenario:
+        {scenario}
+        """
         Scenario:
         {scenario}
         """
@@ -571,7 +601,14 @@ def _gemini_category_from_text(scenario: str) -> Optional[str]:
         ["mart","club","restaurant","pharmacy","hospital","atm","fuel","grocery"]
         Return STRICT JSON only:
         {{"category":"<one of the list or empty>"}}
+        From the scenario, pick ONE category keyword from this list:
+        ["mart","club","restaurant","pharmacy","hospital","atm","fuel","grocery"]
+        Return STRICT JSON only:
+        {{"category":"<one of the list or empty>"}}
 
+        Scenario:
+        {scenario}
+        """
         Scenario:
         {scenario}
         """
@@ -595,6 +632,7 @@ CATEGORY_TO_TYPES = {
     "atm":        ["atm"],
     "fuel":       ["gas_station"],
     "locker":     ["point_of_interest", "post_office", "storage", "convenience_store"],
+    "locker":     ["point_of_interest", "post_office", "storage", "convenience_store"],
 }
 
 CATEGORY_KEYWORDS = {
@@ -606,6 +644,11 @@ CATEGORY_KEYWORDS = {
     "hospital": "hospital",
     "atm": "atm cash machine",
     "fuel": "fuel station OR petrol pump OR gas station",
+    "locker": (
+        "parcel locker OR smart locker OR package locker OR package pickup OR "
+        "package pickup kiosk OR pickup drop-off point OR PUDO OR amazon locker "
+        "OR parcel center OR self-service locker"
+    ),
     "locker": (
         "parcel locker OR smart locker OR package locker OR package pickup OR "
         "package pickup kiosk OR pickup drop-off point OR PUDO OR amazon locker "
@@ -648,8 +691,13 @@ def tool_check_traffic(
     """
     Traffic-aware ETA between two place names (Google Directions).
     Adds: map.embedUrl → ready for <iframe>.
+    Traffic-aware ETA between two place names (Google Directions).
+    Adds: map.embedUrl → ready for <iframe>.
     """
     try:
+        # ---- 1) clean / fallback extraction ----------------------------------
+        o_name = (_only_place_name(origin_any) or "").strip()
+        d_name = (_only_place_name(dest_any) or "").strip()
         # ---- 1) clean / fallback extraction ----------------------------------
         o_name = (_only_place_name(origin_any) or "").strip()
         d_name = (_only_place_name(dest_any) or "").strip()
@@ -661,11 +709,28 @@ def tool_check_traffic(
                 d_name = d_name or (gx_d or "").strip()
             except Exception:
                 pass
+            try:
+                gx_o, gx_d = _extract_places_from_text(scenario_text)
+                o_name = o_name or (gx_o or "").strip()
+                d_name = d_name or (gx_d or "").strip()
+            except Exception:
+                pass
 
         if not o_name or not d_name:
             return {"status": "error", "error": "missing_place_names",
                     "origin_place": o_name or None, "dest_place": d_name or None}
+            return {"status": "error", "error": "missing_place_names",
+                    "origin_place": o_name or None, "dest_place": d_name or None}
 
+        # ---- 2) mode map ------------------------------------------------------
+        mode = {
+            "DRIVE":"driving","DRIVING":"driving","CAR":"driving",
+            "WALK":"walking","WALKING":"walking",
+            "BIKE":"bicycling","BICYCLE":"bicycling","BICYCLING":"bicycling",
+            "TRANSIT":"transit","TWO_WHEELER":"driving",
+        }.get((travel_mode or "DRIVE").strip().upper(), "driving")
+
+        # ---- 3) call Directions API ------------------------------------------
         # ---- 2) mode map ------------------------------------------------------
         mode = {
             "DRIVE":"driving","DRIVING":"driving","CAR":"driving",
@@ -690,7 +755,45 @@ def tool_check_traffic(
                     "origin_place": o_name, "dest_place": d_name, "raw": data}
 
         # ---- 4) parse first route + steps ------------------------------------
+            "origin": o_name, "destination": d_name,
+            "mode": mode, "region": "in", "language": "en",
+            "alternatives": "true", "key": GOOGLE_MAPS_API_KEY,
+        }
+        if mode == "driving":
+            params.update(departure_time="now", traffic_model="best_guess")
+
+        data = requests.get(url, params=params, timeout=15).json()
+        if data.get("status") != "OK" or not data.get("routes"):
+            return {"status": "error", "error": "directions_failed",
+                    "origin_place": o_name, "dest_place": d_name, "raw": data}
+
+        # ---- 4) parse first route + steps ------------------------------------
         leg = data["routes"][0]["legs"][0]
+        norm_sec = (leg["duration"]).get("value", 0)
+        traf_sec = (leg.get("duration_in_traffic") or {}).get("value", norm_sec)
+
+        steps = [{
+            "instructions": s.get("html_instructions"),
+            "distance_m": (s.get("distance") or {}).get("value"),
+            "duration_sec": (s.get("duration") or {}).get("value"),
+            "start_location": s.get("start_location"),
+            "end_location": s.get("end_location"),
+            "polyline": (s.get("polyline") or {}).get("points"),
+        } for s in leg.get("steps", [])]
+
+        # ---- 5) build Embed URL ----------------------------------------------
+        embed_url = (
+            "https://www.google.com/maps/embed/v1/directions"
+            f"?key={GOOGLE_MAPS_API_KEY}"
+            f"&origin={urllib.parse.quote_plus(o_name)}"
+            f"&destination={urllib.parse.quote_plus(d_name)}"
+            f"&mode={mode}"
+        )
+
+        # ---- 6) return --------------------------------------------------------
+        bounds = data["routes"][0].get("bounds")
+        ne, sw = bounds.get("northeast"), bounds.get("southwest") if bounds else (None, None)
+        map_bounds = {"south": sw["lat"], "west": sw["lng"], "north": ne["lat"], "east": ne["lng"]} if ne and sw else None
         norm_sec = (leg["duration"]).get("value", 0)
         traf_sec = (leg.get("duration_in_traffic") or {}).get("value", norm_sec)
 
@@ -731,10 +834,28 @@ def tool_check_traffic(
             },
         }
 
+            "origin_place": o_name, "dest_place": d_name, "mode": mode,
+            "duration_min": round(norm_sec/60), "duration_traffic_min": round(traf_sec/60),
+            "distance_km": round((leg.get("distance") or {}).get("value", 0)/1000, 2),
+            "steps": steps,
+            "map": {
+                "kind": "directions",
+                "bounds": map_bounds,
+                "polyline": data["routes"][0]["overview_polyline"]["points"],
+                "embedUrl": embed_url,            # ←-- new field
+            },
+        }
+
     except Exception as e:
         return {"status": "error", "error": f"traffic_check_failure:{e}",
                 "origin_place": origin_any, "dest_place": dest_any}
   
+        return {"status": "error", "error": f"traffic_check_failure:{e}",
+                "origin_place": origin_any, "dest_place": dest_any}
+  
+
+ROUTES_KEY      = GOOGLE_MAPS_API_KEY         # server-restricted key
+ROUTES_ENDPOINT = "https://routes.googleapis.com/directions/v2:computeRoutes"
 
 ROUTES_KEY      = GOOGLE_MAPS_API_KEY         # server-restricted key
 ROUTES_ENDPOINT = "https://routes.googleapis.com/directions/v2:computeRoutes"
@@ -752,6 +873,13 @@ def tool_calculate_alternative_route(
     d_name = (_only_place_name(dest_any) or "").strip()
     if (not o_name or not d_name) and scenario_text:
         try:
+    """Get main + alternate routes via Routes API (computeAlternativeRoutes=True)."""
+
+    # 1. resolve free-form names --------------------------------
+    o_name = (_only_place_name(origin_any) or "").strip()
+    d_name = (_only_place_name(dest_any) or "").strip()
+    if (not o_name or not d_name) and scenario_text:
+        try:
             gx_o, gx_d = _extract_places_from_text(scenario_text)
             o_name = o_name or (gx_o or "").strip()
             d_name = d_name or (gx_d or "").strip()
@@ -760,7 +888,59 @@ def tool_calculate_alternative_route(
     if not o_name or not d_name:
         return {"status": "error", "error": "missing_place_names",
                 "origin_place": o_name or None, "dest_place": d_name or None}
+            o_name = o_name or (gx_o or "").strip()
+            d_name = d_name or (gx_d or "").strip()
+        except Exception:
+            pass
+    if not o_name or not d_name:
+        return {"status": "error", "error": "missing_place_names",
+                "origin_place": o_name or None, "dest_place": d_name or None}
 
+    # 2. minimal POST body with computeAlternativeRoutes --------
+    body = {
+        "origin": {"address": o_name},
+        "destination": {"address": d_name},
+        "travelMode": travel_mode.upper(),
+        "routingPreference": "TRAFFIC_AWARE",
+        "computeAlternativeRoutes": True,
+    }
+    
+    # Use the correct field mask as per the documentation
+    field_mask = "routes.duration,routes.distanceMeters,routes.routeLabels,routes.polyline.encodedPolyline"
+
+    try:
+        resp = requests.post(
+            ROUTES_ENDPOINT,
+            params={"key": ROUTES_KEY},
+            data=json.dumps(body),
+            headers={
+                "Content-Type": "application/json",
+                "X-Goog-FieldMask": field_mask,
+            },
+            timeout=20,
+        )
+        resp.raise_for_status() # Raises an HTTPError for bad responses (4xx or 5xx)
+        data = resp.json()
+
+    except requests.exceptions.RequestException as e:
+        return {"status": "error", "error": f"routes_api_failed: {e}",
+                "raw": str(e), "origin_place": o_name, "dest_place": d_name}
+
+    # 3. parse every returned route -----------------------------
+    routes_out: List[Dict[str, Any]] = []
+    best_time = None
+    
+    if not data.get("routes"):
+        return {"status": "error", "error": "no_routes_found",
+                "origin_place": o_name, "dest_place": d_name}
+
+    for r in data["routes"]:
+        duration_min = round(int(r["duration"][:-1]) / 60)
+        poly = r["polyline"]["encodedPolyline"]
+        label = r.get("routeLabels", ["DEFAULT_ROUTE"])[0]
+
+        if best_time is None or duration_min < best_time:
+            best_time = duration_min
     # 2. minimal POST body with computeAlternativeRoutes --------
     body = {
         "origin": {"address": o_name},
@@ -817,6 +997,16 @@ def tool_calculate_alternative_route(
 
     default = next((x for x in routes_out if x["summary"] == "DEFAULT_ROUTE"), routes_out[0])
     improvement = max(0, default["durationMin"] - best_time)
+        routes_out.append({
+            "summary": label,
+            "durationMin": duration_min,
+            "trafficMin": duration_min, # Routes API v2 doesn't separate these
+            "distance_km": round(r["distanceMeters"] / 1000, 1),
+            "polyline": poly,
+        })
+
+    default = next((x for x in routes_out if x["summary"] == "DEFAULT_ROUTE"), routes_out[0])
+    improvement = max(0, default["durationMin"] - best_time)
 
     return {
         "status": "ok",
@@ -826,7 +1016,18 @@ def tool_calculate_alternative_route(
         "improvementMin": improvement,
         "map": {
             "kind": "directions",
+    return {
+        "status": "ok",
+        "origin_place": o_name,
+        "dest_place": d_name,
+        "mode": travel_mode.lower(),
+        "improvementMin": improvement,
+        "map": {
+            "kind": "directions",
             "routes": routes_out,
+            "bounds": None, # Routes API v2 doesn’t provide bounds
+        },
+    }
             "bounds": None, # Routes API v2 doesn’t provide bounds
         },
     }
@@ -954,6 +1155,14 @@ def tool_find_nearby_locker(place_name: str,
                          if p.get("currentOpeningHours") else None,
         } for p in top5]
 
+        return {
+            "status": "ok",
+            "count": len(lockers),
+            "lockers": lockers,
+            "center": {"lat": lat, "lon": lon},
+            "query_place": place_name,
+            "used_radius_m": radius_m,
+        }
         return {
             "status": "ok",
             "count": len(lockers),
@@ -2263,6 +2472,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
 }
 
 # ----------------------------- FLASK APP -------------------------------
+
 
 app = Flask(__name__)
 CORS(app, origins=CORS_ORIGINS if CORS_ORIGINS != ["*"] else "*", supports_credentials=True)
