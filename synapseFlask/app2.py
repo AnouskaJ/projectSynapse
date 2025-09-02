@@ -1,10 +1,10 @@
 # app.py
 import datetime
 import os, re, json, time, math, traceback, logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from flask import Flask, request, jsonify, Response, g
+from flask import Flask, request, jsonify, Response, g, session
 from flask_cors import CORS
 import uuid
 
@@ -894,46 +894,35 @@ def tool_pollen_forecast(lat: float, lon: float) -> Dict[str, Any]:
     except Exception as e:
         return {"error": f"pollen_failure:{str(e)}"}
 
-LOCKER_TYPES = [
-    "point_of_interest", "post_office", "storage", "convenience_store"
-]
-LOCKER_KEYWORDS = (
-    "parcel locker OR smart locker OR package locker OR package pickup OR "
-    "package pickup kiosk OR pickup drop-off point OR PUDO OR amazon locker "
-    "OR parcel center OR self-service locker"
-)
+LOCKER_TYPES = ["post_office", "convenience_store"]   # keep ≤ 5 valid types
 
-def tool_find_nearby_locker(
-    place_name: str,
-    radius_m: int = 2000,
-) -> Dict[str, Any]:
+def tool_find_nearby_locker(place_name: str,
+                            radius_m: Optional[int] = None) -> Dict[str, Any]:
     """
-    Find up to 5 parcel / package lockers near a free-form place name.
-      • Geocodes `place_name`  → lat/lon
-      • Calls Places API v1    → places:searchNearby
-      • Uses locker types & keyword bundle
+    Find up to 5 parcel-friendly locations near `place_name`, using only the
+    primary place types (no keyword, radius optional).
     """
 
     if not place_name or not str(place_name).strip():
         return {"status": "error", "error": "missing_place_name", "lockers": []}
 
-    # ── 1 · geocode ------------------------------------------------------
-    center: Optional[Tuple[float, float]] = _geocode(place_name.strip())
+    # 1 ▸ geocode ---------------------------------------------------------
+    center = _geocode(place_name.strip())
     if not center:
         return {"status": "error", "error": "geocode_failed", "lockers": []}
     lat, lon = center
 
-    # ── 2 · build Places request body -----------------------------------
+    # 2 ▸ build Places request body --------------------------------------
     body = {
-        "locationRestriction": {
+        "includedPrimaryTypes": LOCKER_TYPES,
+    }
+    if radius_m:                                # add circle only if a radius is given
+        body["locationRestriction"] = {
             "circle": {
                 "center": {"latitude": lat, "longitude": lon},
                 "radius": float(radius_m),
             }
-        },
-        "includedPrimaryTypes": LOCKER_TYPES,
-        "keyword": LOCKER_KEYWORDS,
-    }
+        }
 
     field_mask = ",".join([
         "places.id", "places.displayName", "places.formattedAddress",
@@ -942,11 +931,10 @@ def tool_find_nearby_locker(
     ])
 
     try:
-        # use your internal wrapper (no direct `requests.post`)
         data = _places_post("places:searchNearby", body, field_mask)
-        places: List = data.get("places", [])
+        places = data.get("places", [])
 
-        # ── 3 · rank & trim top-5 --------------------------------------
+        # 3 ▸ rank & trim -------------------------------------------------
         places.sort(
             key=lambda p: (
                 p.get("rating", 0),
@@ -978,6 +966,16 @@ def tool_find_nearby_locker(
     except Exception as e:
         log.error(f"[find_nearby_locker] failure: {e}")
         return {"status": "error", "error": str(e), "lockers": []}
+  
+def tool_mark_as_placed(locker_id: str, order_id: str) -> Dict[str, Any]:
+    """
+    Mark the order as placed in the selected locker.
+    In a real system this would call the locker provider’s API.
+    """
+    # TODO: integrate with real locker API
+    log.info(f"[locker] placed order {order_id} into locker {locker_id}")
+    return {"status": "ok", "order_id": order_id, "locker_id": locker_id}
+
 def tool_places_search_nearby(
     lat_any: Any = None,
     lon_any: Any = None,
@@ -1226,13 +1224,15 @@ def tool_get_nearby_merchants(lat: float, lon: float, radius_m: int = 2000) -> D
         results = resp.get("results", [])
         merchants = []
         for p in results[:5]:
+            loc = p["geometry"]["location"]
             merchants.append({
-                "id": p.get("place_id"),
-                "name": p.get("name"),
-                "address": p.get("vicinity"),
+                "id": p["place_id"],
+                "name": p["name"],
+                "address": p["vicinity"],
                 "rating": p.get("rating"),
                 "user_ratings_total": p.get("user_ratings_total"),
-                "etaMin": None,   # you could later integrate Routes API to estimate ETA
+                "lat": loc["lat"],
+                "lng": loc["lng"], 
             })
 
         return {"count": len(merchants), "merchants": merchants}
@@ -1618,43 +1618,68 @@ def _policy_next_extended(kind: str, steps_done: int, hints: Dict[str, Any]) -> 
                 "No driver location available; skipping reroute."
             )
 
-        # Step 2: Suggest alternatives — real nearby restaurants via Places
+        # ──────────────────────────────
+        # Step 2 : fetch nearby alternates
+        # ──────────────────────────────
         if steps_done == 2:
-            latlon = None
-            if isinstance(hints.get("origin"), (list, tuple)) and len(hints["origin"]) == 2:
-                latlon = hints["origin"]
-            elif isinstance(hints.get("dest"), (list, tuple)) and len(hints["dest"]) == 2:
-                latlon = hints["dest"]
-
-            if latlon:
+            latlon = hints.get("origin") or hints.get("dest")
+            if latlon and isinstance(latlon, (list, tuple)) and len(latlon) == 2:
                 return (
                     "get nearby alternates",
                     "get_nearby_merchants",
                     {"lat": float(latlon[0]), "lon": float(latlon[1]), "radius_m": 2000},
                     "merchants>0",
-                    "continue",
+                    "continue",                     # <-- not final any more
                     None,
-                    "Fetch up to 5 similar nearby restaurants using Google Places."
+                    "Fetch up to 5 faster restaurants.",
                 )
+            # fall back to notify if no coords
+            steps_done = 3                         # force skip to notify
 
-            # Finish if we cannot search
-            return (
-                "done (no coords)",
-                "none",
-                {},
-                None,
-                "final",
-                "Customer notified; driver rerouted. No location available to suggest alternates.",
-                "Cannot search alternates without a center."
-            )
-
-        # Step 3: Push notify with alternates (real FCM)
+        # ──────────────────────────────
+        # Step 3 : ask which restaurant
+        # ──────────────────────────────
         if steps_done == 3:
+            merchants = hints.get("merchants")     # cached by executor
+            choice    = answers.get("alt_choice")
+            # ❶ ask once
+            if merchants and choice is None:
+                opts = [m["name"] for m in merchants] + ["NO • Continue with this restaurant"]
+                hints.setdefault("meta", {})["alt_id_by_name"] = {
+                    m["name"]: m["id"] for m in merchants
+                }
+                q = {
+                    "question_id": "alt_choice",
+                    "question": "Prep time is long. Pick an alternate or choose NO:",
+                    "expected": "string",
+                    "options": opts,
+                }
+                return (
+                    "clarify", "none", q, None,
+                    "await_input",
+                    "Awaiting customer choice.",
+                    "Offer alternates.",
+                )
+            # ❷ handle answer
+            if choice:
+                selected_id = hints["meta"]["alt_id_by_name"].get(choice)
+                hints["selected_alt_id"] = selected_id   # could be None if NO
+                steps_done = 4                           # fall through to notify
+
+        # ──────────────────────────────
+        # Step 4 : notify with result
+        # ──────────────────────────────
+        if steps_done == 4:
+            chosen = hints.get("selected_alt_id")
+            msg = (
+                f"We’ll switch to **{answers['alt_choice']}** (faster)." if chosen
+                else "We’ll keep your current restaurant."
+            )
             params = {
                 "fcm_token": token,
-                "message": "We found a few nearby options with shorter prep times. We’ll switch to the fastest available unless you object.",
+                "title": "Update on your order",
+                "message": msg,
                 "voucher": True,
-                "title": "Alternatives available"
             }
             assertion = "delivered==true" if (token or FCM_DRY_RUN) else None
             return (
@@ -1663,18 +1688,13 @@ def _policy_next_extended(kind: str, steps_done: int, hints: Dict[str, Any]) -> 
                 params,
                 assertion,
                 "final",
-                "Customer informed; alternates shared.",
-                "Close loop with customer."
+                "Customer informed of choice.",
+                "Close loop with customer.",
             )
 
         return None
+    
     # Damage dispute
-    # --- inside _policy_next_extended(...)
-
-    # app.py ─ in _policy_next_extended(), replace the whole damage_dispute block with:
-
-    # inside _policy_next_extended(kind, steps_done, hints)
-
     if kind == "damage_dispute":
         order_id    = hints.get("order_id", "order_demo")
         driver_id   = hints.get("driver_id", "driver_demo")
@@ -1755,113 +1775,148 @@ def _policy_next_extended(kind: str, steps_done: int, hints: Dict[str, Any]) -> 
                 None, "final", "Resolution communicated to all parties.", "Finalizing the dispute."
             )
         return None
-# Recipient unavailable (interactive permission step)
+    # ---------------------------------------------------------------------
+    #  recipient_unavailable  → safe-drop? → choose locker → notify
+    # ---------------------------------------------------------------------
     if kind == "recipient_unavailable":
         answers = hints.get("answers") or {}
+        lockers = hints.get("lockers")                 # filled after tool runs
+        chosen  = answers.get("chosen_locker_id")      # filled via clarify
 
+        # 0 ▸ open chat once
         if steps_done == 0:
             rid = hints.get("recipient_id", "recipient_demo")
             return (
-                "reach out via chat",
-                "contact_recipient_via_chat",
-                {"recipient_id": rid, "message": "Driver has arrived. How should we proceed?"},
+                "reach out via chat", "contact_recipient_via_chat",
+                {"recipient_id": rid,
+                "message": "Driver has arrived. How should we proceed?"},
                 "messagesent!=none",
-                "continue",
-                None,
+                "continue", None,
                 "Start chat to coordinate.",
             )
 
-        # --- Safe drop check ---
+        # 1 ▸ safe-drop permission
         safe_ok = _truthy_str(answers.get("safe_drop_ok"))
         if safe_ok is None:
-            q = {
-                "question_id": "safe_drop_ok",
-                "question": "Recipient unavailable. Is it okay to leave the package with the building concierge or a neighbor?",
-                "expected": "boolean",
-                "options": ["yes", "no"],
-            }
             return (
-                "clarify",
-                "none",
-                q,
-                None,
-                "await_input",
-                "Awaiting input: Recipient unavailable. Is it okay to leave the package with the building concierge or a neighbor?",
+                "clarify", "none",
+                {
+                    "question_id": "safe_drop_ok",
+                    "question": ("Recipient unavailable. Is it OK to leave the "
+                                "package with the building concierge or a neighbour?"),
+                    "expected": "boolean",
+                    "options": ["yes", "no"],
+                },
+                None, "await_input",
+                "Awaiting safe-drop permission.",
                 "Ask for safe-drop permission.",
             )
 
         if safe_ok is True:
             addr = hints.get("dest_place") or "Building concierge"
             return (
-                "suggest safe drop",
-                "suggest_safe_drop_off",
+                "suggest safe drop", "suggest_safe_drop_off",
                 {"address": addr},
                 "suggested==true",
                 "final",
-                "Safe drop approved; driver will leave package with concierge.",
+                "Safe-drop approved; driver will leave package with concierge.",
                 "Proceed with safe drop.",
             )
 
-        # --- Locker fallback if safe drop not allowed ---
+        # 2 ▸ locker fallback gate
         locker_ok = _truthy_str(answers.get("locker_ok"))
         if locker_ok is None:
-            q = {
-                "question_id": "locker_ok",
-                "question": "Safe drop not allowed. Should I route to the nearest secure parcel locker instead?",
-                "expected": "boolean",
-                "options": ["yes", "no"],
-            }
             return (
-                "clarify",
-                "none",
-                q,
-                None,
-                "await_input",
-                "Awaiting input: Safe drop not allowed. Route to a nearby locker?",
+                "clarify", "none",
+                {
+                    "question_id": "locker_ok",
+                    "question": ("Safe-drop not allowed. Should I route to the "
+                                "nearest parcel/post-office locker instead?"),
+                    "expected": "boolean",
+                    "options": ["yes", "no"],
+                },
+                None, "await_input",
+                "Awaiting locker permission.",
                 "Offer locker fallback.",
             )
 
-        # --- Try lockers first (regardless of yes/no), then notify if we can't search ---
-        dest_place = hints.get("dest_place")
-        if dest_place:
-            # Use place name → our locker finder (Google Places under the hood)
+        # 3 ▸ we already have lockers → ask which one
+        if lockers and chosen is None:
+            opts = [l["name"] for l in lockers]
+            hints.setdefault("meta", {})["locker_ids"] = {
+                l["name"]: l["id"] for l in lockers
+            }
             return (
-                "find locker",
-                "find_nearby_locker",
-                {"place_name": dest_place, "radius_m": 1500},
-                "lockers>0",
-                "final",
-                "Suggested nearest parcel locker from Google Maps.",
-                "Provide locker fallback.",
+                "clarify", "none",
+                {
+                    "question_id": "chosen_locker_id",
+                    "question": "Select a locker for the driver:",
+                    "expected": "string",
+                    "options": opts,
+                },
+                None, "await_input",
+                "Awaiting locker choice.",
+                "Ask which locker.",
             )
 
-        # If no place name, but we have coordinates → fall back to Places Nearby with locker keyword
-        latlon = hints.get("dest") or hints.get("origin")
-        if latlon and isinstance(latlon, (list, tuple)) and len(latlon) == 2:
+        # 4 ▸ locker chosen → send confirmation push
+        if chosen:
+            locker_id = hints["meta"]["locker_ids"].get(chosen, chosen)
             return (
-                "find locker (coords)",
-                "places_search_nearby",
-                {"lat": latlon[0], "lon": latlon[1], "radius_m": 1500, "keyword": "parcel locker OR package pickup OR amazon locker OR smart locker"},
-                "count>0",
+                "notify", "notify_customer",
+                {
+                    "fcm_token": hints.get("customer_token") or DEFAULT_CUSTOMER_TOKEN,
+                    "title": "Package secured",
+                    "message": (f"Your parcel has been placed in locker "
+                                f"{locker_id}. Pick-up code sent via SMS/Email."),
+                    "voucher": False,
+                },
+                "delivered==true",
                 "final",
-                "Suggested nearest parcel locker based on current location.",
-                "Fallback locker search by coordinates.",
+                "Locker selected and customer notified.",
+                "Confirm locker drop-off.",
             )
 
-        # If we cannot search lockers at all → notify customer
+        # 5 ▸ lockers not fetched yet → fetch once
+        if lockers is None:
+            dest_place = hints.get("dest_place")
+            if dest_place:
+                return (
+                    "find locker", "find_nearby_locker",
+                    {"place_name": dest_place, "radius_m": 15000},
+                    "lockers>0",
+                    "continue",          # <-- NOT final
+                    "Found lockers, will prompt recipient.",
+                    "Search lockers.",
+                )
+
+            latlon = hints.get("dest") or hints.get("origin")
+            if latlon and isinstance(latlon, (list, tuple)) and len(latlon) == 2:
+                return (
+                    "find locker (coords)", "places_search_nearby",
+                    {"lat": latlon[0], "lon": latlon[1],
+                    "radius_m": 15000,
+                    "keyword": "parcel locker OR package pickup OR amazon locker OR smart locker"},
+                    "count>0",
+                    "continue",          # <-- NOT final
+                    "Found lockers by coordinates; will prompt recipient.",
+                    "Search lockers by coordinates.",
+                )
+
+        # 6 ▸ still nothing → escalate to customer
         return (
-            "notify",
-            "notify_customer",
+            "notify", "notify_customer",
             {
                 "fcm_token": hints.get("customer_token") or DEFAULT_CUSTOMER_TOKEN,
-                "message": "Delivery attempted; no safe drop, and no lockers could be suggested. Please advise next steps.",
-                "voucher": False,
                 "title": "Delivery attempt",
+                "message": ("Delivery attempted; no safe-drop and no lockers "
+                            "could be suggested. Please advise next steps."),
+                "voucher": False,
             },
             "delivered==true",
             "final",
-            "Awaiting recipient guidance (no place/coords available to search lockers).",
-            "Notify customer due to insufficient location data.",
+            "Awaiting recipient guidance (no location for lockers).",
+            "Notify customer due to insufficient data.",
         )
 
     # Unknown/other kinds: stop after classification
@@ -1949,6 +2004,12 @@ class SynapseAgent:
                     fn = TOOLS.get(tool, {}).get("fn")
                     if callable(fn):
                         obs = fn(**(params or {}))
+                        if tool in ("find_nearby_locker", "places_search_nearby") and isinstance(obs, dict):
+                            if obs.get("lockers"):
+                                hints["lockers"] = obs["lockers"]
+                        if tool == "get_nearby_merchants" and obs.get("merchants"):
+                            hints["merchants"] = obs["merchants"]
+                        session["hints"]  = hints  
                         if tool not in ("none", "ask_user") and isinstance(obs, dict):
                             # stash key outputs for later policy checks
                             if tool == "analyze_evidence":
@@ -2189,7 +2250,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "suggest_safe_drop_off": {"fn": lambda address: {"address": address, "suggested": True},
                               "desc": "Suggest safe place.", "schema": {"address":"str"}},
     "find_nearby_locker": {
-    "fn": lambda place_name, radius_m=1500: tool_find_nearby_locker(place_name, radius_m)},
+    "fn": lambda place_name, radius_m=15000: tool_find_nearby_locker(place_name, radius_m)},
     "check_flight_status": {"fn": lambda flight_no: {"flight": flight_no, "status": "DELAYED", "delayMin": 45},
                             "desc": "Flight status check.", "schema": {"flight_no":"str"}},
 
@@ -2410,7 +2471,8 @@ def resolve_sync_endpoint():
     # First-run mode
     scenario = (data.get("scenario") or "").strip()
     if not scenario:
-        return jsonify({"error":"missing scenario"}), 400
+        return jsonify({"error":"missing scenario"
+                        }), 400
 
     driver_token = (data.get("driver_token") or "").strip()
     passenger_token = (data.get("passenger_token") or "").strip()

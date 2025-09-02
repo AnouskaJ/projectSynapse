@@ -7,6 +7,7 @@ import { MAPS_BROWSER_KEY } from "../../config";
 
 /* Lazy-load the heavy map only when needed */
 const AltRoutesMap = lazy(() => import("./AltRoutesMap"));
+const MerchantMap = lazy(() => import("./MerchantMap"));
 
 /* Helper → build a simple Directions embed URL */
 const buildEmbed = (m, p = {}) => {
@@ -41,8 +42,6 @@ export default function StepItem({ step, index, active = false, complete = false
 
   /* -------- decide what to render as `mapElement` -------- */
   const mapElement = useMemo(() => {
-    const m = step?.observation?.map;
-    if (!m) return null;
 
     const isAltCalc     = step.tool === "calculate_alternative_route";
     const isCheckTraffic = step.tool === "check_traffic";
@@ -62,10 +61,22 @@ export default function StepItem({ step, index, active = false, complete = false
       const url = m.embedUrl || buildEmbed(m, step.params);
       return url ? <StepEmbedMap url={url} /> : null;
     }
+    if (step.tool === "get_nearby_merchants" && step.observation?.merchants?.length) {
+      const merchants = step.observation.merchants;
+      const center = { lat: merchants[0].lat, lng: merchants[0].lng ?? merchants[0].lon };
+      return (
+        <Suspense fallback={<div className="h-96 w-full bg-black/20" />}>
+          <MerchantMap center={center} merchants={merchants} />
+        </Suspense>
+      );
+    }
 
+    const m = step?.observation?.map;
+    if (!m) return null;
+   
     /* ── all other tools ── */
     if (m.embedUrl) return <StepEmbedMap url={m.embedUrl} />;
-
+ 
     const url = buildEmbed(m, step.params);
     return url ? <StepEmbedMap url={url} /> : null;
   }, [step]);

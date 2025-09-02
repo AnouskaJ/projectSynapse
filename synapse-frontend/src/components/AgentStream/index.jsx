@@ -191,14 +191,15 @@ export default function AgentStream({ scenarioText }) {
       const ans = clarify?.question_id ? { [clarify.question_id]: answer } : {};
       setClarify(null);
       setAnswerDraft("");
-
       const qs = new URLSearchParams({
-        session_id: sessionId,
-        answers: JSON.stringify(ans),
-        passenger_token: liveTok,
-        customer_token: liveTok,
-      });
-      wireSSE(`${API_BASE}/api/agent/run?${qs}`);
+      session_id: sessionId,
+      question_id: clarify.question_id,
+      expected: clarify.expected || "text",
+      answer: Array.isArray(answer) ? JSON.stringify(answer) : String(answer),
+      passenger_token: liveTok,
+      customer_token: liveTok,
+    });
+    wireSSE(`${API_BASE}/api/agent/clarify/continue?${qs}`);
     } catch (e) {
       setStatus("error");
       setError(e.message ?? "Failed to resume");
