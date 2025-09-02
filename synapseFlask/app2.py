@@ -1,4 +1,5 @@
 # app.py
+import datetime
 import os, re, json, time, math, traceback, logging
 from typing import Any, Dict, List, Optional
 
@@ -6,6 +7,8 @@ import requests
 from flask import Flask, request, jsonify, Response, g
 from flask_cors import CORS
 import uuid
+
+import urllib
 
 # In-memory store for clarification sessions
 CLARIFY_SESSIONS: Dict[str, Any] = {}
@@ -56,53 +59,7 @@ if not GOOGLE_MAPS_API_KEY:
 # ---- Dummy orders store (used for driver reroute) --------------------
 ORDERS_FILE = os.path.join(os.path.dirname(__file__), "orders.json")
 
-def _seed_orders_if_missing():
-    if os.path.exists(ORDERS_FILE):
-        return
-    seed = {
-        "orders": [
-            {
-                "id": "o1001",
-                "pickup":  {"lat": 12.9809, "lon": 80.2213, "address": "Taramani Link Rd, Velachery"},
-                "dropoff": {"lat": 12.9863, "lon": 80.2592, "address": "Besant Nagar Beach"},
-                "etaMinEstimate": 18,
-                "status": "pending"
-            },
-            {
-                "id": "o1002",
-                "pickup":  {"lat": 12.9922, "lon": 80.2450, "address": "Adyar Depot"},
-                "dropoff": {"lat": 13.0038, "lon": 80.2560, "address": "Indira Nagar"},
-                "etaMinEstimate": 15,
-                "status": "pending"
-            },
-            {
-                "id": "o1003",
-                "pickup":  {"lat": 12.9710, "lon": 80.2408, "address": "Velachery MRTS"},
-                "dropoff": {"lat": 12.9534, "lon": 80.2506, "address": "Thiruvanmiyur"},
-                "etaMinEstimate": 14,
-                "status": "pending"
-            },
-            {
-                "id": "o1004",
-                "pickup":  {"lat": 12.9119, "lon": 80.2244, "address": "OMR Sholinganallur"},
-                "dropoff": {"lat": 12.9205, "lon": 80.2273, "address": "Perungudi"},
-                "etaMinEstimate": 22,
-                "status": "pending"
-            },
-            {
-                "id": "o1005",
-                "pickup":  {"lat": 12.9846, "lon": 80.2345, "address": "Guindy"},
-                "dropoff": {"lat": 12.9991, "lon": 80.2568, "address": "Kasturibai Nagar"},
-                "etaMinEstimate": 16,
-                "status": "pending"
-            }
-        ]
-    }
-    with open(ORDERS_FILE, "w") as f:
-        json.dump(seed, f, indent=2)
-
 def _load_orders() -> Dict[str, Any]:
-    _seed_orders_if_missing()
     with open(ORDERS_FILE, "r") as f:
         return json.load(f)
 
@@ -122,7 +79,6 @@ class LLMWrapper:
         self.model = model
 
     def generate_content(self, contents, **kwargs):
-        # Support both string and list for backward compat
         if isinstance(contents, str):
             contents = [contents]
         return self.client.models.generate_content(
@@ -295,7 +251,6 @@ def _truthy_str(v: Any) -> Optional[bool]:
     return None
 
 # --- Evidence helpers ---
-# --- Evidence helpers ---
 UPLOADS_ROOT = os.path.join(os.path.dirname(__file__), "uploads")
 os.makedirs(UPLOADS_ROOT, exist_ok=True)
 
@@ -349,7 +304,6 @@ def _load_evidence_files(order_id: str) -> list[str]:
 
 
 # -------------------------- HINT EXTRACTORS ---------------------------
-# -------------------------- HINT EXTRACTORS ---------------------------
 HINT_RE_ORIGIN = re.compile(r"origin\s*=\s*([0-9.+-]+)\s*,\s*([0-9.+-]+)", re.I)
 HINT_RE_DEST   = re.compile(r"dest\s*=\s*([0-9.+-]+)\s*,\s*([0-9.+-]+)", re.I)
 
@@ -385,10 +339,6 @@ def _gm_headers(field_mask: Optional[str] = None) -> Dict[str, str]:
     if field_mask:
         h["X-Goog-FieldMask"] = field_mask
     return h
-
-def _routes_post(path: str, body: dict, field_mask: str) -> dict:
-    url = f"https://routes.googleapis.com/{path}"
-    return http_post(url, body, headers=_gm_headers(field_mask))
 
 def _places_post(path: str, body: dict, field_mask: str) -> dict:
     url = f"https://places.googleapis.com/v1/{path}"
@@ -429,19 +379,10 @@ def _only_place_name(val: Any) -> Optional[str]:
 import base64, mimetypes, time
 from uuid import uuid4
 
-UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")  # wherever you save
+UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")  
 
 def _ensure_upload_dir():
     os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-def _save_bytes(order_id: str, raw: bytes, mime: str) -> str:
-    _ensure_upload_dir()
-    ext = mimetypes.guess_extension(mime) or ".jpg"
-    fname = f"evidence_{order_id}_{int(time.time()*1000)}_{uuid4().hex[:6]}{ext}"
-    path = os.path.join(UPLOAD_DIR, fname)
-    with open(path, "wb") as f:
-        f.write(raw)
-    return path
 
 import base64, mimetypes
 
@@ -494,6 +435,7 @@ def tool_analyze_evidence(order_id: str, images=None, notes=None):
     # Build the request: strings for text, Parts for images
     prompt = (
         "Analyze these spilled package photos and if the package looks spilled then suggest refund_reasonable as true, else false with rationale.\n"
+        "Mostly favour a rfund if the package is open/spilled.\n"
         "Return ONLY valid JSON like:\n"
         "{\n"
         '  "fault": "merchant|driver|unclear",\n'
@@ -506,7 +448,7 @@ def tool_analyze_evidence(order_id: str, images=None, notes=None):
 
     try:
         resp = _llm.generate_content(
-        contents=[prompt] + parts # The _llm object already has the model info
+        contents=[prompt] + parts 
     )
         raw = getattr(resp, "text", "") or ""
     except Exception as e:
@@ -566,22 +508,22 @@ def _gemini_route_from_text(scenario: str) -> Dict[str, Optional[str]]:
     Returns {"origin_place": str|None, "dest_place": str|None}
     """
     prompt = f"""
-Extract exactly TWO concise place names from the scenario: the pickup/origin and the dropoff/destination.
+        Extract exactly TWO concise place names from the scenario: the pickup/origin and the dropoff/destination.
 
-Return STRICT JSON only:
-{{
-  "origin_place": "<origin place name or empty if unknown>",
-  "dest_place": "<destination place name or empty if unknown>"
-}}
+        Return STRICT JSON only:
+        {{
+        "origin_place": "<origin place name or empty if unknown>",
+        "dest_place": "<destination place name or empty if unknown>"
+        }}
 
-Rules:
-- Prefer the most specific, human-readable names (street + area, mall name, etc.).
-- If only one place is mentioned, treat it as the destination and leave origin empty.
-- Do not include coordinates or extra punctuation.
+        Rules:
+        - Prefer the most specific, human-readable names (street + area, mall name, etc.).
+        - If only one place is mentioned, treat it as the destination and leave origin empty.
+        - Do not include coordinates or extra punctuation.
 
-Scenario:
-{scenario}
-"""
+        Scenario:
+        {scenario}
+        """
     try:
         resp = client.models.generate_content(model=GEMINI_MODEL, contents=[prompt])
         text = getattr(resp, "text", "") or "{}"
@@ -597,19 +539,19 @@ def _gemini_place_from_text(scenario: str) -> Optional[str]:
     Extract ONE concise center place from free text (used to anchor 'nearby' searches).
     """
     prompt = f"""
-Extract ONE concise place name from the scenario that best represents the search center.
-Return STRICT JSON only:
-{{
-  "place_name": "<single place or empty>"
-}}
+        Extract ONE concise place name from the scenario that best represents the search center.
+        Return STRICT JSON only:
+        {{
+        "place_name": "<single place or empty>"
+        }}
 
-Rules:
-- Prefer destination-like areas if present; else a prominent locality in the text.
-- Use human-readable names only (no coordinates/punctuation).
+        Rules:
+        - Prefer destination-like areas if present; else a prominent locality in the text.
+        - Use human-readable names only (no coordinates/punctuation).
 
-Scenario:
-{scenario}
-"""
+        Scenario:
+        {scenario}
+        """
     try:
         resp = _llm.generate_content(prompt)
         data = safe_json(strip_json_block(getattr(resp, "text", "") or "{}"), {}) or {}
@@ -625,14 +567,14 @@ def _gemini_category_from_text(scenario: str) -> Optional[str]:
     Supported categories: mart, club, restaurant, pharmacy, hospital, atm, fuel, grocery
     """
     prompt = f"""
-From the scenario, pick ONE category keyword from this list:
-["mart","club","restaurant","pharmacy","hospital","atm","fuel","grocery"]
-Return STRICT JSON only:
-{{"category":"<one of the list or empty>"}}
+        From the scenario, pick ONE category keyword from this list:
+        ["mart","club","restaurant","pharmacy","hospital","atm","fuel","grocery"]
+        Return STRICT JSON only:
+        {{"category":"<one of the list or empty>"}}
 
-Scenario:
-{scenario}
-"""
+        Scenario:
+        {scenario}
+        """
     try:
         resp = _llm.generate_content(prompt)
         data = safe_json(strip_json_block(getattr(resp, "text", "") or "{}"), {}) or {}
@@ -652,6 +594,7 @@ CATEGORY_TO_TYPES = {
     "hospital":   ["hospital"],
     "atm":        ["atm"],
     "fuel":       ["gas_station"],
+    "locker":     ["point_of_interest", "post_office", "storage", "convenience_store"],
 }
 
 CATEGORY_KEYWORDS = {
@@ -663,6 +606,11 @@ CATEGORY_KEYWORDS = {
     "hospital": "hospital",
     "atm": "atm cash machine",
     "fuel": "fuel station OR petrol pump OR gas station",
+    "locker": (
+        "parcel locker OR smart locker OR package locker OR package pickup OR "
+        "package pickup kiosk OR pickup drop-off point OR PUDO OR amazon locker "
+        "OR parcel center OR self-service locker"
+    ),
 }
 
 # --- place-only traffic tools ----------------------------------------------
@@ -691,7 +639,6 @@ def tool_initiate_mediation_flow(order_id: str) -> Dict[str, Any]:
     removed = _purge_evidence(order_id)
     return {"order_id": order_id, "flow": "started", "purgedFiles": removed}
 
-
 def tool_check_traffic(
     origin_any: Optional[str] = None,
     dest_any: Optional[str] = None,
@@ -699,61 +646,98 @@ def tool_check_traffic(
     scenario_text: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Traffic-aware ETA between two **place names** (no lat/lng required).
-    If origin/dest are missing or not plain names, extract them from scenario_text via Gemini.
+    Traffic-aware ETA between two place names (Google Directions).
+    Adds: map.embedUrl → ready for <iframe>.
     """
     try:
-        # Ensure we have clean place strings
-        o_name = _only_place_name(origin_any)
-        d_name = _only_place_name(dest_any)
+        # ---- 1) clean / fallback extraction ----------------------------------
+        o_name = (_only_place_name(origin_any) or "").strip()
+        d_name = (_only_place_name(dest_any) or "").strip()
 
         if (not o_name or not d_name) and scenario_text:
-            gx_o, gx_d = _extract_places_from_text(scenario_text)
-            o_name = o_name or gx_o
-            d_name = d_name or gx_d
+            try:
+                gx_o, gx_d = _extract_places_from_text(scenario_text)
+                o_name = o_name or (gx_o or "").strip()
+                d_name = d_name or (gx_d or "").strip()
+            except Exception:
+                pass
 
         if not o_name or not d_name:
-            return {"error": "missing_place_names", "origin_place": o_name, "dest_place": d_name}
+            return {"status": "error", "error": "missing_place_names",
+                    "origin_place": o_name or None, "dest_place": d_name or None}
 
+        # ---- 2) mode map ------------------------------------------------------
+        mode = {
+            "DRIVE":"driving","DRIVING":"driving","CAR":"driving",
+            "WALK":"walking","WALKING":"walking",
+            "BIKE":"bicycling","BICYCLE":"bicycling","BICYCLING":"bicycling",
+            "TRANSIT":"transit","TWO_WHEELER":"driving",
+        }.get((travel_mode or "DRIVE").strip().upper(), "driving")
+
+        # ---- 3) call Directions API ------------------------------------------
         url = "https://maps.googleapis.com/maps/api/directions/json"
         params = {
-            "origin": o_name,
-            "destination": d_name,
-            "mode": travel_mode.lower(),
-            "departure_time": "now",
-            "key": GOOGLE_MAPS_API_KEY,   # ✅ correct key
+            "origin": o_name, "destination": d_name,
+            "mode": mode, "region": "in", "language": "en",
+            "alternatives": "true", "key": GOOGLE_MAPS_API_KEY,
         }
-        r = requests.get(url, params=params, timeout=15)
-        data = r.json()
+        if mode == "driving":
+            params.update(departure_time="now", traffic_model="best_guess")
 
-        if data.get("status") != "OK":
-            return {
-                "error": "directions_failed",
-                "status": data.get("status"),
-                "origin_place": o_name,
-                "dest_place": d_name,
-                "raw": data,
-            }
+        data = requests.get(url, params=params, timeout=15).json()
+        if data.get("status") != "OK" or not data.get("routes"):
+            return {"status": "error", "error": "directions_failed",
+                    "origin_place": o_name, "dest_place": d_name, "raw": data}
 
+        # ---- 4) parse first route + steps ------------------------------------
         leg = data["routes"][0]["legs"][0]
-        normal_sec = (leg.get("duration") or {}).get("value", 0)
-        traffic_sec = (leg.get("duration_in_traffic") or {}).get("value", normal_sec)
-        normal_min = normal_sec // 60
-        traffic_min = traffic_sec // 60
-        delay_min = max(0, traffic_min - normal_min)
+        norm_sec = (leg["duration"]).get("value", 0)
+        traf_sec = (leg.get("duration_in_traffic") or {}).get("value", norm_sec)
+
+        steps = [{
+            "instructions": s.get("html_instructions"),
+            "distance_m": (s.get("distance") or {}).get("value"),
+            "duration_sec": (s.get("duration") or {}).get("value"),
+            "start_location": s.get("start_location"),
+            "end_location": s.get("end_location"),
+            "polyline": (s.get("polyline") or {}).get("points"),
+        } for s in leg.get("steps", [])]
+
+        # ---- 5) build Embed URL ----------------------------------------------
+        embed_url = (
+            "https://www.google.com/maps/embed/v1/directions"
+            f"?key={GOOGLE_MAPS_API_KEY}"
+            f"&origin={urllib.parse.quote_plus(o_name)}"
+            f"&destination={urllib.parse.quote_plus(d_name)}"
+            f"&mode={mode}"
+        )
+
+        # ---- 6) return --------------------------------------------------------
+        bounds = data["routes"][0].get("bounds")
+        ne, sw = bounds.get("northeast"), bounds.get("southwest") if bounds else (None, None)
+        map_bounds = {"south": sw["lat"], "west": sw["lng"], "north": ne["lat"], "east": ne["lng"]} if ne and sw else None
 
         return {
             "status": "ok",
-            "origin_place": o_name,
-            "dest_place": d_name,
-            "normalMin": normal_min,
-            "trafficMin": traffic_min,
-            "delayMin": delay_min,               # <-- assertion delayMin>=0
-            "summary": data["routes"][0].get("summary"),
+            "origin_place": o_name, "dest_place": d_name, "mode": mode,
+            "duration_min": round(norm_sec/60), "duration_traffic_min": round(traf_sec/60),
+            "distance_km": round((leg.get("distance") or {}).get("value", 0)/1000, 2),
+            "steps": steps,
+            "map": {
+                "kind": "directions",
+                "bounds": map_bounds,
+                "polyline": data["routes"][0]["overview_polyline"]["points"],
+                "embedUrl": embed_url,            # ←-- new field
+            },
         }
-    except Exception as e:
-        return {"error": f"traffic_check_failure:{e}"}
 
+    except Exception as e:
+        return {"status": "error", "error": f"traffic_check_failure:{e}",
+                "origin_place": origin_any, "dest_place": dest_any}
+  
+
+ROUTES_KEY      = GOOGLE_MAPS_API_KEY         # server-restricted key
+ROUTES_ENDPOINT = "https://routes.googleapis.com/directions/v2:computeRoutes"
 
 def tool_calculate_alternative_route(
     origin_any: Optional[str] = None,
@@ -761,81 +745,91 @@ def tool_calculate_alternative_route(
     travel_mode: str = "DRIVE",
     scenario_text: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Get alternate routes **by place names**; compute improvementMin (>=0).
-    improvementMin = (current traffic ETA) - (best traffic ETA among alternatives, including current).
-    """
-    try:
-        # Ensure we have clean place strings
-        o_name = _only_place_name(origin_any)
-        d_name = _only_place_name(dest_any)
+    """Get main + alternate routes via Routes API (computeAlternativeRoutes=True)."""
 
-        if (not o_name or not d_name) and scenario_text:
+    # 1. resolve free-form names --------------------------------
+    o_name = (_only_place_name(origin_any) or "").strip()
+    d_name = (_only_place_name(dest_any) or "").strip()
+    if (not o_name or not d_name) and scenario_text:
+        try:
             gx_o, gx_d = _extract_places_from_text(scenario_text)
-            o_name = o_name or gx_o
-            d_name = d_name or gx_d
+            o_name = o_name or (gx_o or "").strip()
+            d_name = d_name or (gx_d or "").strip()
+        except Exception:
+            pass
+    if not o_name or not d_name:
+        return {"status": "error", "error": "missing_place_names",
+                "origin_place": o_name or None, "dest_place": d_name or None}
 
-        if not o_name or not d_name:
-            return {"error": "missing_place_names", "origin_place": o_name, "dest_place": d_name}
+    # 2. minimal POST body with computeAlternativeRoutes --------
+    body = {
+        "origin": {"address": o_name},
+        "destination": {"address": d_name},
+        "travelMode": travel_mode.upper(),
+        "routingPreference": "TRAFFIC_AWARE",
+        "computeAlternativeRoutes": True,
+    }
+    
+    # Use the correct field mask as per the documentation
+    field_mask = "routes.duration,routes.distanceMeters,routes.routeLabels,routes.polyline.encodedPolyline"
 
-        url = "https://maps.googleapis.com/maps/api/directions/json"
-        params = {
-            "origin": o_name,
-            "destination": d_name,
-            "mode": travel_mode.lower(),
-            "alternatives": "true",
-            "departure_time": "now",
-            "key": GOOGLE_MAPS_API_KEY,   # ✅ correct key
-        }
-        r = requests.get(url, params=params, timeout=20)
-        data = r.json()
+    try:
+        resp = requests.post(
+            ROUTES_ENDPOINT,
+            params={"key": ROUTES_KEY},
+            data=json.dumps(body),
+            headers={
+                "Content-Type": "application/json",
+                "X-Goog-FieldMask": field_mask,
+            },
+            timeout=20,
+        )
+        resp.raise_for_status() # Raises an HTTPError for bad responses (4xx or 5xx)
+        data = resp.json()
 
-        if data.get("status") != "OK":
-            return {
-                "error": "directions_failed",
-                "status": data.get("status"),
-                "origin_place": o_name,
-                "dest_place": d_name,
-                "raw": data,
-            }
+    except requests.exceptions.RequestException as e:
+        return {"status": "error", "error": f"routes_api_failed: {e}",
+                "raw": str(e), "origin_place": o_name, "dest_place": d_name}
 
-        routes_out = []
-        best_traffic_min = None
-        current_traffic_min = None
+    # 3. parse every returned route -----------------------------
+    routes_out: List[Dict[str, Any]] = []
+    best_time = None
+    
+    if not data.get("routes"):
+        return {"status": "error", "error": "no_routes_found",
+                "origin_place": o_name, "dest_place": d_name}
 
-        for idx, route in enumerate(data.get("routes", [])):
-            leg = route["legs"][0]
-            normal_sec = (leg.get("duration") or {}).get("value", 0)
-            traffic_sec = (leg.get("duration_in_traffic") or {}).get("value", normal_sec)
-            normal_min = normal_sec // 60
-            traffic_min = traffic_sec // 60
+    for r in data["routes"]:
+        duration_min = round(int(r["duration"][:-1]) / 60)
+        poly = r["polyline"]["encodedPolyline"]
+        label = r.get("routeLabels", ["DEFAULT_ROUTE"])[0]
 
-            if idx == 0:
-                current_traffic_min = traffic_min
-            if best_traffic_min is None or traffic_min < best_traffic_min:
-                best_traffic_min = traffic_min
+        if best_time is None or duration_min < best_time:
+            best_time = duration_min
 
-            routes_out.append({
-                "summary": route.get("summary"),
-                "durationMin": normal_min,
-                "trafficMin": traffic_min,
-            })
+        routes_out.append({
+            "summary": label,
+            "durationMin": duration_min,
+            "trafficMin": duration_min, # Routes API v2 doesn't separate these
+            "distance_km": round(r["distanceMeters"] / 1000, 1),
+            "polyline": poly,
+        })
 
-        # Safety
-        if current_traffic_min is None or best_traffic_min is None:
-            improvement = 0
-        else:
-            improvement = max(0, current_traffic_min - best_traffic_min)
+    default = next((x for x in routes_out if x["summary"] == "DEFAULT_ROUTE"), routes_out[0])
+    improvement = max(0, default["durationMin"] - best_time)
 
-        return {
-            "status": "ok",
-            "origin_place": o_name,
-            "dest_place": d_name,
+    return {
+        "status": "ok",
+        "origin_place": o_name,
+        "dest_place": d_name,
+        "mode": travel_mode.lower(),
+        "improvementMin": improvement,
+        "map": {
+            "kind": "directions",
             "routes": routes_out,
-            "improvementMin": improvement,       # <-- assertion improvementMin>=0
-        }
-    except Exception as e:
-        return {"error": f"alt_route_failure:{e}"}
+            "bounds": None, # Routes API v2 doesn’t provide bounds
+        },
+    }
 
 def tool_compute_route_matrix(origins: List[Any], destinations: List[Any]) -> Dict[str, Any]:
     if not origins or not destinations:
@@ -900,36 +894,90 @@ def tool_pollen_forecast(lat: float, lon: float) -> Dict[str, Any]:
     except Exception as e:
         return {"error": f"pollen_failure:{str(e)}"}
 
-def tool_find_nearby_locker(lat: float, lon: float, radius_m: int = 2000) -> Dict[str, Any]:
+LOCKER_TYPES = [
+    "point_of_interest", "post_office", "storage", "convenience_store"
+]
+LOCKER_KEYWORDS = (
+    "parcel locker OR smart locker OR package locker OR package pickup OR "
+    "package pickup kiosk OR pickup drop-off point OR PUDO OR amazon locker "
+    "OR parcel center OR self-service locker"
+)
+
+def tool_find_nearby_locker(
+    place_name: str,
+    radius_m: int = 2000,
+) -> Dict[str, Any]:
     """
-    Use Google Places Nearby Search to get up to 5 parcel lockers near given coords.
+    Find up to 5 parcel / package lockers near a free-form place name.
+      • Geocodes `place_name`  → lat/lon
+      • Calls Places API v1    → places:searchNearby
+      • Uses locker types & keyword bundle
     """
+
+    if not place_name or not str(place_name).strip():
+        return {"status": "error", "error": "missing_place_name", "lockers": []}
+
+    # ── 1 · geocode ------------------------------------------------------
+    center: Optional[Tuple[float, float]] = _geocode(place_name.strip())
+    if not center:
+        return {"status": "error", "error": "geocode_failed", "lockers": []}
+    lat, lon = center
+
+    # ── 2 · build Places request body -----------------------------------
+    body = {
+        "locationRestriction": {
+            "circle": {
+                "center": {"latitude": lat, "longitude": lon},
+                "radius": float(radius_m),
+            }
+        },
+        "includedPrimaryTypes": LOCKER_TYPES,
+        "keyword": LOCKER_KEYWORDS,
+    }
+
+    field_mask = ",".join([
+        "places.id", "places.displayName", "places.formattedAddress",
+        "places.rating", "places.userRatingCount",
+        "places.currentOpeningHours.openNow",
+    ])
+
     try:
-        places_url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
-        params = {
-            "location": f"{lat},{lon}",
-            "radius": radius_m,
-            "type": "restaurant", 
-            "key": GOOGLE_MAPS_API_KEY,
+        # use your internal wrapper (no direct `requests.post`)
+        data = _places_post("places:searchNearby", body, field_mask)
+        places: List = data.get("places", [])
+
+        # ── 3 · rank & trim top-5 --------------------------------------
+        places.sort(
+            key=lambda p: (
+                p.get("rating", 0),
+                math.log((p.get("userRatingCount") or 0) + 1)
+            ),
+            reverse=True,
+        )
+        top5 = places[:5]
+
+        lockers = [{
+            "id": p.get("id"),
+            "name": (p.get("displayName") or {}).get("text"),
+            "address": p.get("formattedAddress"),
+            "rating": p.get("rating"),
+            "user_ratings_total": p.get("userRatingCount"),
+            "open_now": (p.get("currentOpeningHours") or {}).get("openNow")
+                         if p.get("currentOpeningHours") else None,
+        } for p in top5]
+
+        return {
+            "status": "ok",
+            "count": len(lockers),
+            "lockers": lockers,
+            "center": {"lat": lat, "lon": lon},
+            "query_place": place_name,
+            "used_radius_m": radius_m,
         }
-        resp = requests.get(places_url, params=params, timeout=15).json()
-
-        results = resp.get("results", [])
-        lockers = []
-        for p in results[:5]:  # Get the top 5 results
-            lockers.append({
-                "id": p.get("place_id"),
-                "name": p.get("name"),
-                "address": p.get("vicinity"),
-                "rating": p.get("rating"),
-                "user_ratings_total": p.get("user_ratings_total"),
-            })
-
-        return {"count": len(lockers), "lockers": lockers}
 
     except Exception as e:
-        log.error(f"[find_nearby_locker] An error occurred: {e}")
-        return {"count": 0, "lockers": [], "error": str(e)}
+        log.error(f"[find_nearby_locker] failure: {e}")
+        return {"status": "error", "error": str(e), "lockers": []}
 def tool_places_search_nearby(
     lat_any: Any = None,
     lon_any: Any = None,
@@ -2154,7 +2202,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
 }
 
 # ----------------------------- FLASK APP -------------------------------
-_seed_orders_if_missing()
+
 app = Flask(__name__)
 CORS(app, origins=CORS_ORIGINS if CORS_ORIGINS != ["*"] else "*", supports_credentials=True)
 agent = SynapseAgent(_llm)
