@@ -1,100 +1,141 @@
 # 🚚 Synapse: AI-Powered Logistics Coordinator
 
-**Synapse** is a full-stack demo showcasing an intelligent agent that automates the resolution of common last-mile logistics issues.  
-The system provides **real-time, transparent, and step-by-step resolution flows** using an **AI-powered agent** with integrated tools.
+Synapse is a full-stack application showcasing an intelligent AI agent that **automates last-mile logistics resolution**. The system provides **real-time, transparent, and step-by-step flows** using an AI agent equipped with specialized tools.
 
 ---
 
-## 🏛️ Architecture & Data Flow
+## ✨ Features
 
-The architecture follows a **client-server model** built around an **agentic workflow**:
-
-- **Frontend (React):**  
-  Provides a clean interface for users to select or enter logistics scenarios. Displays real-time updates from the agent.  
-
-- **Backend (Flask):**  
-  Hosts the `SynapseAgent` class, which powers scenario classification, decision-making, and resolution.  
-
-- **Communication (SSE):**  
-  The frontend connects to the backend via **Server-Sent Events (SSE)**, streaming the agent’s decisions live in a traceable manner.  
-
-### 🔄 Workflow Overview
-1. **Scenario Submission** – User enters a scenario and clicks *Run*.  
-2. **URL Construction** – `src/utils/api.js` builds a request URL for `/api/agent/run`.  
-3. **Persistent Connection** – `AgentStream.jsx` opens an `EventSource`, subscribing to backend updates.  
-4. **Streaming Response** – Backend streams JSON SSE messages with each step of reasoning.  
-5. **User Clarification** – If user input is required (e.g., uploading photos), the backend pauses with a `"clarify"` event.  
-   The flow resumes after input via `/api/agent/clarify/continue`.  
+* 🧠 **AI-Powered Classification** – Uses Google Gemini to analyze and classify logistics scenarios (e.g., traffic, damage dispute, merchant capacity).
+* 📡 **Real-Time Streaming Updates** – React frontend streams live agent decisions from the Flask backend via **Server-Sent Events (SSE)**.
+* 🔧 **Multi-Tool Agent** – Access to multiple tools: Google Maps for traffic, Gemini Vision for evidence analysis, Firebase Cloud Messaging (FCM) for notifications.
+* 🗣️ **Interactive Clarifications** – Agent can pause workflows, request user inputs (photos, confirmations), and resume seamlessly.
+* 🔀 **Deterministic Workflows** – Rule-based pipelines ensure predictable, reliable resolutions across scenarios.
 
 ---
 
-## 🧠 Agent Logic
+## 🏛️ Architecture
 
-The **SynapseAgent** drives all reasoning.  
-
-- **Classification:**  
-  Scenarios are analyzed via **Gemini prompts** → classified into `kind` (e.g., `traffic`, `damage_dispute`) and `severity`.  
-
-- **State Machine:**  
-  The `_policy_next_extended` function defines workflows for each scenario type, step by step.  
+<img width="813" height="464" alt="image" src="https://github.com/user-attachments/assets/37f2ba98-510f-4e49-83fb-ee7c95bc6b2f" />
 
 ---
 
-## 🔀 Scenario Workflows
+## 🔌 API Endpoints
 
-### 🚦 Traffic Scenario
-1. `tool_check_traffic` → get traffic-aware ETA.  
-2. `tool_calculate_alternative_route` → suggest faster routes.  
-3. `check_flight_status` (if flight number provided).  
-4. `tool_notify_passenger_and_driver` → update both parties.  
-
----
-
-### 🍔 Merchant Capacity Scenario
-1. `tool_notify_customer` → proactive delay notice + voucher.  
-2. `tool_reroute_driver` → reassign driver to nearby short order.  
-3. `tool_get_nearby_merchants` → suggest faster alternatives to customer.  
+| Method | Endpoint                      | Description                                    | Triggered By                         |
+| ------ | ----------------------------- | ---------------------------------------------- | ------------------------------------ |
+| `GET`  | `/api/agent/run`              | Initiates new agent run via SSE stream.        | `start()` in `AgentStream/index.jsx` |
+| `GET`  | `/api/agent/clarify/continue` | Resumes paused agent after user clarification. | `resumeWithAnswer()`                 |
+| `POST` | `/api/evidence/upload`        | Handles file uploads for damage disputes.      | `onSubmit()` in `ImageAnswer.jsx`    |
+| `GET`  | `/api/health`                 | Backend health/status check.                   | Diagnostics                          |
+| `GET`  | `/api/tools`                  | Lists all available agent tools.               | Diagnostics                          |
 
 ---
 
-### 📦 Damage Dispute Scenario
-1. `tool_initiate_mediation_flow` → clear prior evidence.  
-2. `tool_ask_user` → request photo uploads.  
-3. `tool_collect_evidence` → save images.  
-4. `tool_analyze_evidence` → AI model determines fault.  
-5. **Conditional Actions:**  
-   - Merchant fault → `exonerate_driver`, `log_merchant_packaging_feedback`.  
-   - Refund justified → `issue_instant_refund`.  
-6. `tool_notify_resolution` → close loop with both parties.  
+## 🔄 Workflow Overview
+
+1. **Scenario Submission** → User enters a scenario in `ScenarioForm.jsx`.
+2. **State Update** → `Scenario.jsx` triggers `onRun()`.
+3. **Stream Initiation** → `AgentStream/index.jsx` starts and builds API URL.
+4. **Authentication** → `utils/api.js` fetches Firebase ID token.
+5. **SSE Connection** → Opens stream to `/api/agent/run`.
+6. **Agent Execution** → Backend classifies scenario (Gemini), runs tools step-by-step.
+7. **Live Updates** → Frontend renders SSE messages in real-time.
+8. **Clarification Loop** → Pauses on `clarify` events, resumes after user response.
 
 ---
 
-### 🚪 Recipient Unavailable Scenario
-1. `tool_contact_recipient_via_chat`.  
-2. If no response → ask sender’s permission (`tool_ask_user`).  
-   - ✅ Yes → `tool_suggest_safe_drop_off`.  
-   - ❌ No → `tool_find_nearby_locker`.  
+## 🔧 Agent Toolset
+
+### 🚦 Traffic Scenarios
+
+* `check_traffic` – Google Directions ETA & routes
+* `calculate_alternative_route` – Alternative routes
+* `check_flight_status` – Mock flight updates
+* `notify_passenger_and_driver` – FCM notifications
+
+### 🍔 Merchant Capacity
+
+* `notify_customer` – Delay alerts & vouchers
+* `reroute_driver` – Reassign drivers (mock DB)
+* `get_nearby_merchants` – Google Places API
+
+### 📦 Damage Dispute
+
+* `initiate_mediation_flow` – Reset evidence
+* `ask_user` – Request user photos/info
+* `collect_evidence` – Save images/notes
+* `analyze_evidence` – Gemini Vision for damage analysis
+* `issue_instant_refund`, `exonerate_driver` – Mock resolutions
+* `notify_resolution` – Send outcomes to both parties
+
+### 🚪 Recipient Unavailable
+
+* `contact_recipient_via_chat` – Mock messaging
+* `suggest_safe_drop_off` – Confirm safe-drop locations
+* `find_nearby_locker` – Nearby lockers via Google Places
+
+### 🌍 Utility Tools
+
+* `geocode_place` – Convert address → lat/long
+* `check_weather`, `air_quality`, `pollen_forecast` – Environmental data
 
 ---
 
-## ⚙️ Tech Stack
+## 🚀 Getting Started
 
-- **Frontend:** React, EventSource (SSE)  
-- **Backend:** Python Flask, SSE streaming  
-- **AI Layer:** Gemini (classification, evidence analysis)  
-- **Database:** Mock JSON datasets (orders,merchants)  
+### Prerequisites
+
+* Node.js + npm
+* Python + pip
 
 ---
 
-## 🚀 Running Locally
+### 1. Backend Setup (`synapseFlask`)
 
 ```bash
-# Backend setup
-cd backend
+cd synapseFlask
 pip install -r requirements.txt
-python app.py
+```
 
-# Frontend setup
-cd frontend
+**Configuration:**
+
+* Place Firebase Service Account `.json` in `synapseFlask/`
+* Create `config.json` with:
+
+```json
+{
+  "GOOGLE_APPLICATION_CREDENTIALS": "service-account.json",
+  "MAPS_API_KEY": "<your_google_maps_key>",
+  "GEMINI_API_KEY": "<your_gemini_key>"
+}
+```
+
+**Run Server:**
+
+```bash
+python app2.py
+# Runs on http://127.0.0.1:5000
+```
+
+---
+
+### 2. Frontend Setup (`synapse-frontend`)
+
+```bash
+cd synapse-frontend
 npm install
 npm run dev
+# Runs on http://localhost:5173
+```
+
+---
+
+## 📌 Roadmap
+
+* [ ] Add support for multilingual scenario handling
+* [ ] Extend workflows for logistics fraud detection
+* [ ] Dockerize deployment for production environments
+* [ ] Add CI/CD pipelines with GitHub Actions
+
+---
