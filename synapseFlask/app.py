@@ -2578,7 +2578,7 @@ def fcm_send():
     res = _fcm_v1_send(token, title, body, extra)
     return jsonify(res)
 
-# helpers near the top
+
 def _parse_answer(raw, expected):
     if expected in {"image[]", "string[]"}:
         try:
