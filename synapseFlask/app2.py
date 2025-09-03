@@ -736,7 +736,9 @@ def tool_check_traffic(
                 "origin_place": origin_any, "dest_place": dest_any}
   
 
-ROUTES_KEY      = GOOGLE_MAPS_API_KEY         # server-restricted key
+# app2.py
+
+ROUTES_KEY = GOOGLE_MAPS_API_KEY
 ROUTES_ENDPOINT = "https://routes.googleapis.com/directions/v2:computeRoutes"
 
 def tool_calculate_alternative_route(
@@ -747,7 +749,7 @@ def tool_calculate_alternative_route(
 ) -> Dict[str, Any]:
     """Get main + alternate routes via Routes API (computeAlternativeRoutes=True)."""
 
-    # 1. resolve free-form names --------------------------------
+    # 1. resolve free-form names
     o_name = (_only_place_name(origin_any) or "").strip()
     d_name = (_only_place_name(dest_any) or "").strip()
     if (not o_name or not d_name) and scenario_text:
@@ -761,7 +763,7 @@ def tool_calculate_alternative_route(
         return {"status": "error", "error": "missing_place_names",
                 "origin_place": o_name or None, "dest_place": d_name or None}
 
-    # 2. minimal POST body with computeAlternativeRoutes --------
+    # 2. minimal POST body with computeAlternativeRoutes
     body = {
         "origin": {"address": o_name},
         "destination": {"address": d_name},
@@ -769,9 +771,9 @@ def tool_calculate_alternative_route(
         "routingPreference": "TRAFFIC_AWARE",
         "computeAlternativeRoutes": True,
     }
-    
-    # Use the correct field mask as per the documentation
-    field_mask = "routes.duration,routes.distanceMeters,routes.routeLabels,routes.polyline.encodedPolyline"
+
+    # Use the correct field mask
+    field_mask = "routes.duration,routes.distanceMeters,routes.routeLabels,routes.polyline.encodedPolyline,routes.legs.startLocation,routes.legs.endLocation"
 
     try:
         resp = requests.post(
@@ -784,17 +786,19 @@ def tool_calculate_alternative_route(
             },
             timeout=20,
         )
-        resp.raise_for_status() # Raises an HTTPError for bad responses (4xx or 5xx)
+        resp.raise_for_status()
         data = resp.json()
 
     except requests.exceptions.RequestException as e:
         return {"status": "error", "error": f"routes_api_failed: {e}",
                 "raw": str(e), "origin_place": o_name, "dest_place": d_name}
 
-    # 3. parse every returned route -----------------------------
+    # 3. parse every returned route
     routes_out: List[Dict[str, Any]] = []
-    best_time = None
-    
+    best_time = float('inf')
+    default_duration = None
+    all_points = []
+
     if not data.get("routes"):
         return {"status": "error", "error": "no_routes_found",
                 "origin_place": o_name, "dest_place": d_name}
@@ -804,19 +808,39 @@ def tool_calculate_alternative_route(
         poly = r["polyline"]["encodedPolyline"]
         label = r.get("routeLabels", ["DEFAULT_ROUTE"])[0]
 
-        if best_time is None or duration_min < best_time:
+        if label == "DEFAULT_ROUTE":
+            default_duration = duration_min
+
+        if duration_min < best_time:
             best_time = duration_min
 
         routes_out.append({
             "summary": label,
             "durationMin": duration_min,
-            "trafficMin": duration_min, # Routes API v2 doesn't separate these
+            "trafficMin": duration_min,
             "distance_km": round(r["distanceMeters"] / 1000, 1),
             "polyline": poly,
         })
 
-    default = next((x for x in routes_out if x["summary"] == "DEFAULT_ROUTE"), routes_out[0])
-    improvement = max(0, default["durationMin"] - best_time)
+        for leg in r.get("legs", []):
+            start_loc = leg.get("startLocation", {}).get("latLng", {})
+            end_loc = leg.get("endLocation", {}).get("latLng", {})
+            if start_loc:
+                all_points.append({"lat": start_loc["latitude"], "lng": start_loc["longitude"]})
+            if end_loc:
+                all_points.append({"lat": end_loc["latitude"], "lng": end_loc["longitude"]})
+
+    # Manually calculate bounds from start and end points of all legs
+    if all_points:
+        min_lat = min(p["lat"] for p in all_points)
+        max_lat = max(p["lat"] for p in all_points)
+        min_lon = min(p["lng"] for p in all_points)
+        max_lon = max(p["lng"] for p in all_points)
+        map_bounds = {"south": min_lat, "west": min_lon, "north": max_lat, "east": max_lon}
+    else:
+        map_bounds = None
+
+    improvement = max(0, (default_duration or 0) - best_time)
 
     return {
         "status": "ok",
@@ -827,7 +851,7 @@ def tool_calculate_alternative_route(
         "map": {
             "kind": "directions",
             "routes": routes_out,
-            "bounds": None, # Routes API v2 doesn’t provide bounds
+            "bounds": map_bounds,
         },
     }
 
@@ -894,30 +918,65 @@ def tool_pollen_forecast(lat: float, lon: float) -> Dict[str, Any]:
     except Exception as e:
         return {"error": f"pollen_failure:{str(e)}"}
 
-def tool_find_nearby_locker(lat: float, lon: float, radius_m: int = 2000) -> Dict[str, Any]:
-    """
-    Use Google Places Nearby Search to get up to 5 parcel lockers near given coords.
-    """
-    try:
-        places_url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
-        params = {
-            "location": f"{lat},{lon}",
-            "radius": radius_m,
-            "type": "restaurant", 
-            "key": GOOGLE_MAPS_API_KEY,
-        }
-        resp = requests.get(places_url, params=params, timeout=15).json()
+LOCKER_TYPES = ["post_office", "convenience_store"]   # keep ≤ 5 valid types
 
-        results = resp.get("results", [])
-        lockers = []
-        for p in results[:5]:  # Get the top 5 results
-            lockers.append({
-                "id": p.get("place_id"),
-                "name": p.get("name"),
-                "address": p.get("vicinity"),
-                "rating": p.get("rating"),
-                "user_ratings_total": p.get("user_ratings_total"),
-            })
+def tool_find_nearby_locker(place_name: str,
+                            radius_m: Optional[int] = None) -> Dict[str, Any]:
+    """
+    Find up to 5 parcel-friendly locations near `place_name`, using only the
+    primary place types (no keyword, radius optional).
+    """
+
+    if not place_name or not str(place_name).strip():
+        return {"status": "error", "error": "missing_place_name", "lockers": []}
+
+    # 1 ▸ geocode ---------------------------------------------------------
+    center = _geocode(place_name.strip())
+    if not center:
+        return {"status": "error", "error": "geocode_failed", "lockers": []}
+    lat, lon = center
+
+    # 2 ▸ build Places request body --------------------------------------
+    body = {
+        "includedPrimaryTypes": LOCKER_TYPES,
+    }
+    if radius_m:                                # add circle only if a radius is given
+        body["locationRestriction"] = {
+            "circle": {
+                "center": {"latitude": lat, "longitude": lon},
+                "radius": float(radius_m),
+            }
+        }
+
+    field_mask = ",".join([
+        "places.id", "places.displayName", "places.formattedAddress",
+        "places.rating", "places.userRatingCount",
+        "places.currentOpeningHours.openNow",
+    ])
+
+    try:
+        data = _places_post("places:searchNearby", body, field_mask)
+        places = data.get("places", [])
+
+        # 3 ▸ rank & trim -------------------------------------------------
+        places.sort(
+            key=lambda p: (
+                p.get("rating", 0),
+                math.log((p.get("userRatingCount") or 0) + 1)
+            ),
+            reverse=True,
+        )
+        top5 = places[:5]
+
+        lockers = [{
+            "id": p.get("id"),
+            "name": (p.get("displayName") or {}).get("text"),
+            "address": p.get("formattedAddress"),
+            "rating": p.get("rating"),
+            "user_ratings_total": p.get("userRatingCount"),
+            "open_now": (p.get("currentOpeningHours") or {}).get("openNow")
+                         if p.get("currentOpeningHours") else None,
+        } for p in top5]
 
         return {
             "status": "ok",
@@ -929,8 +988,19 @@ def tool_find_nearby_locker(lat: float, lon: float, radius_m: int = 2000) -> Dic
         }
 
     except Exception as e:
-        log.error(f"[find_nearby_locker] An error occurred: {e}")
-        return {"count": 0, "lockers": [], "error": str(e)}
+        log.error(f"[find_nearby_locker] failure: {e}")
+        return {"status": "error", "error": str(e), "lockers": []}
+  
+def tool_mark_as_placed(locker_id: str, order_id: str) -> Dict[str, Any]:
+    """
+    Mark the order as placed in the selected locker.
+    In a real system this would call the locker provider’s API.
+    """
+    # TODO: integrate with real locker API
+    log.info(f"[locker] placed order {order_id} into locker {locker_id}")
+    return {"status": "ok", "order_id": order_id, "locker_id": locker_id}
+
+
 def tool_places_search_nearby(
     lat_any: Any = None,
     lon_any: Any = None,
@@ -1311,7 +1381,7 @@ def check_assertion(assertion: Optional[str], observation: Dict[str, Any]) -> bo
         v = observation.get("improvementMin")
         return isinstance(v, (int, float)) and v > 0
 
-    if "improvementmin>=0" in a:
+    if "len(routes)>=1" in a:
         return isinstance(observation.get("improvementMin"), (int, float))
 
     if "etadeltamin<=0" in a:
@@ -1423,12 +1493,14 @@ Scenario:
 """
 
 # ----------------------------- POLICY RAILS (extended) -----------------
-def _policy_next_extended(kind: str, steps_done: int, hints: Dict[str, Any]) -> Optional[tuple]:
+def _policy_next_extended(kind: str, steps_done: int, hints: Dict[str, Any], sid: Optional[str] = None) -> Optional[Tuple]:
     """
-    Returns:
-      (intent, tool, params, assertion, finish_reason, final_message, reason)
+    Returns the next action for the agent based on the scenario kind and current step.
+    This version includes a complete, multi-step flow for 'merchant_capacity'.
     """
-    # Traffic
+    # This function assumes all other helper functions (e.g., _only_place_name,
+    # _extract_places_from_text, _session_load, _session_save) are correctly
+    # defined elsewhere in the application.
     if kind == "traffic":
         # we ignore coordinates; keep only human place strings
         scen = hints.get("scenario_text") or ""
@@ -1445,7 +1517,7 @@ def _policy_next_extended(kind: str, steps_done: int, hints: Dict[str, Any]) -> 
                 "question_id": "route_text",
                 "question": (
                     "Please provide pickup and drop as place names only, "
-                    "e.g. \"origin=SRMIST, dest=Chennai International Airport\"."
+                    "e.g. \"origin=SRMIST Chennai, dest=Chennai International Airport\"."
                 ),
                 "expected": "text",
             }
@@ -1518,221 +1590,196 @@ def _policy_next_extended(kind: str, steps_done: int, hints: Dict[str, Any]) -> 
                 {"driver_token": hints.get("driver_token"), "passenger_token": hints.get("passenger_token"), "message": msg},
                 "delivered==true", "final", "Reroute applied; driver and passenger notified with all context.", "Notify both parties with the updated route/ETA and flight status if available."
             )
-        
-    # Merchant capacity — notify → real reroute → suggest alternates → push
+
     if kind == "merchant_capacity":
+        answers = hints.get("answers") or {}
+        merchants = hints.get("merchants") or []
+        chosen = answers.get("alt_choice")
         token = hints.get("customer_token") or DEFAULT_CUSTOMER_TOKEN
         driver_id = hints.get("driver_id", "driver_demo")
 
-        # Step 0: Proactively notify customer (real FCM)
+        # Step 0: Proactively notify the customer about the delay.
         if steps_done == 0:
             params = {
                 "fcm_token": token,
-                "message": "The restaurant is experiencing a long prep time (~40 min). We’re minimizing delays and will keep you updated. A small voucher has been applied for the inconvenience.",
+                "message": ("The restaurant is experiencing a long prep time (~40 min). "
+                            "We’re minimizing delays and will keep you updated. "
+                            "A small voucher has been applied for the inconvenience."),
                 "voucher": True,
-                "title": "Delay notice"
+                "title": "Delay notice",
             }
             assertion = "delivered==true" if (token or FCM_DRY_RUN) else None
             return (
-                "notify customer about delay",
-                "notify_customer",
-                params,
-                assertion,
-                "continue",
-                None,
+                "notify customer about delay", "notify_customer",
+                params, assertion, "continue", None,
                 "Proactively inform customer and offer voucher."
             )
 
-        # Step 1: Actually reroute the driver to a quick nearby order
+        # Step 1: Optionally reroute driver to a quick nearby order.
         if steps_done == 1:
-            # Try to infer current driver location: prefer origin (restaurant) then dest
-            latlon = None
-            if isinstance(hints.get("origin"), (list, tuple)) and len(hints["origin"]) == 2:
-                latlon = hints["origin"]
-            elif isinstance(hints.get("dest"), (list, tuple)) and len(hints["dest"]) == 2:
-                latlon = hints["dest"]
-
-            if latlon:
+            latlon = hints.get("origin") or hints.get("dest")
+            if latlon and isinstance(latlon, (list, tuple)) and len(latlon) == 2:
                 return (
-                    "reroute driver to quick nearby order",
-                    "reroute_driver",
+                    "reroute driver to quick nearby order", "reroute_driver",
                     {"driver_id": driver_id, "driver_lat": float(latlon[0]), "driver_lon": float(latlon[1])},
-                    None,
-                    "continue",
-                    None,
+                    None, "continue", None,
                     "Reduce driver idle time using orders.json."
                 )
-            # If we lack a reasonable location, skip reroute
             return (
-                "skip reroute (no coords)",
-                "none",
-                {},
-                None,
-                "continue",
-                None,
-                "No driver location available; skipping reroute."
+                "skip reroute (no coords)", "noop", {}, None, "continue", None,
+                "No driver location; skipping reroute."
             )
 
-        # ──────────────────────────────
-        # Step 2 : fetch nearby alternates
-        # ──────────────────────────────
+        # Step 2: Fetch nearby alternative merchants.
         if steps_done == 2:
             latlon = hints.get("origin") or hints.get("dest")
             if latlon and isinstance(latlon, (list, tuple)) and len(latlon) == 2:
                 return (
-                    "get nearby alternates",
-                    "get_nearby_merchants",
+                    "get nearby alternates", "get_nearby_merchants",
                     {"lat": float(latlon[0]), "lon": float(latlon[1]), "radius_m": 2000},
-                    "merchants>0",
-                    "continue",                     # <-- not final any more
-                    None,
-                    "Fetch up to 5 faster restaurants.",
+                    "merchants>0", "continue", None,
+                    "Fetch up to 5 faster restaurants."
                 )
-            # fall back to notify if no coords
-            steps_done = 3                         # force skip to notify
+            return (
+                "skip fetching alternates", "noop", {}, None, "final",
+                "Cannot fetch alternates without location.", "Cannot proceed with alternatives."
+            )
 
-        # ──────────────────────────────
-        # Step 3 : ask which restaurant
-        # ──────────────────────────────
+        # Step 3: Ask the user to choose an alternative (if merchants were found).
         if steps_done == 3:
-            merchants = hints.get("merchants")     # cached by executor
-            choice    = answers.get("alt_choice")
-            # ❶ ask once
-            if merchants and choice is None:
+            def _is_unanswered(x):
+                return x is None or (isinstance(x, str) and x.strip().lower() in ("", "null", "none"))
+
+            if merchants and _is_unanswered(chosen):
                 opts = [m["name"] for m in merchants] + ["NO • Continue with this restaurant"]
-                hints.setdefault("meta", {})["alt_id_by_name"] = {
-                    m["name"]: m["id"] for m in merchants
-                }
-                q = {
-                    "question_id": "alt_choice",
+                hints.setdefault("meta", {})["alt_id_by_name"] = {m["name"]: m["id"] for m in merchants}
+                _sess = _session_load(sid) or {}
+                _sess["hints"] = hints
+                _session_save(sid, _sess)
+
+                return (
+                    "clarify alternate", "ask_user",
+                    {"question_id": "alt_choice",
                     "question": "Prep time is long. Pick an alternate or choose NO:",
                     "expected": "string",
-                    "options": opts,
-                }
-                return (
-                    "clarify", "none", q, None,
-                    "await_input",
-                    "Awaiting customer choice.",
-                    "Offer alternates.",
+                    "options": opts},
+                    None, "await_input", "Awaiting customer choice.",
+                    "Offer alternates."
                 )
-            # ❷ handle answer
-            if choice:
-                selected_id = hints["meta"]["alt_id_by_name"].get(choice)
-                hints["selected_alt_id"] = selected_id   # could be None if NO
-                steps_done = 4                           # fall through to notify
-
-        # ──────────────────────────────
-        # Step 4 : notify with result
-        # ──────────────────────────────
+            # If merchants are not found or the question has already been answered,
+            # this is where the flow previously stopped. We now add the new step.
+            
+            # The flow should now automatically proceed to the next step (step 4)
+            # if the user has provided an answer. The `resolve_stream` function
+            # correctly increments `steps_done` and resumes the loop.
+            
+            # This return is for when no merchants are found.
+            return None 
+            
+        # Step 4: This is the new step. It is triggered after a user's answer.
         if steps_done == 4:
-            chosen = hints.get("selected_alt_id")
-            msg = (
-                f"We’ll switch to **{answers['alt_choice']}** (faster)." if chosen
-                else "We’ll keep your current restaurant."
-            )
-            params = {
-                "fcm_token": token,
-                "title": "Update on your order",
-                "message": msg,
-                "voucher": True,
-            }
-            assertion = "delivered==true" if (token or FCM_DRY_RUN) else None
+            # Check if a choice was made and if it's not the "NO" option
+            chosen_name = answers.get("alt_choice")
+            if chosen_name and isinstance(chosen_name, str) and not chosen_name.upper().startswith("NO"):
+                msg = f"We’ve switched your order to {chosen_name} to minimize delays."
+            else:
+                msg = "We’ll keep your current restaurant and will let you know once the food is ready for pickup."
+            
             return (
-                "notify customer with alternates",
-                "notify_customer",
-                params,
-                assertion,
-                "final",
-                "Customer informed of choice.",
-                "Close loop with customer.",
+                "inform customer of choice", "notify_customer",
+                {"fcm_token": token, "title": "Order Update", "message": msg},
+                "delivered==true", "final",
+                "Customer notified of their choice.", "Finalize transaction based on user input."
             )
 
-        return None
-    
-    # Damage dispute
+    # ---------------------------------------------------------------------
+    #  damage_dispute: start → ask photos → collect evidence → analyze → decide → notify
+    # ---------------------------------------------------------------------
     if kind == "damage_dispute":
-        order_id    = hints.get("order_id", "order_demo")
-        driver_id   = hints.get("driver_id", "driver_demo")
-        merchant_id = hints.get("merchant_id", "merchant_demo")
-
+        order_id = "123"
+        driver_id = "123"
+        merchant_id = "123"
         answers = hints.get("answers") or {}
-        imgs  = hints.get("evidence_images") or answers.get("evidence_images")
-        notes = hints.get("evidence_notes")  or answers.get("evidence_notes")
+        imgs = hints.get("evidence_images") or answers.get("evidence_images")
+        notes = hints.get("evidence_notes") or answers.get("evidence_notes")
 
+        # Step 0: Start structured mediation flow.
         if steps_done == 0:
             return ("start mediation", "initiate_mediation_flow",
                     {"order_id": order_id}, "flow==started",
                     "continue", None, "Start structured mediation.")
 
+        # Step 1: Request images from the user.
         if steps_done == 1:
             if not imgs and not _load_evidence_files(order_id):
                 return ("request images", "ask_user",
-                        {"question_id":"evidence_images",
-                        "question":"Please upload clear photos of the spilled package (seal, bag, spillage close-ups).",
-                        "expected":"image[]"},
+                        {"question_id": "evidence_images",
+                         "question": "Please upload clear photos of the spilled package (seal, bag, spillage close-ups).",
+                         "expected": "image[]"},
                         None, "await_input",
                         "Awaiting photos.", "Need photos to analyze.")
+            return None
+
+        # Step 2: Collect and process the evidence from the user.
+        if steps_done == 2:
             return ("collect evidence", "collect_evidence",
                     {"order_id": order_id, "images": imgs, "notes": notes},
                     "photos>0", "continue", None, "Persist evidence.")
 
-        if steps_done == 2:
+        # Step 3: Analyze the evidence with Gemini Vision.
+        if steps_done == 3:
             return ("analyze evidence", "analyze_evidence",
                     {"order_id": order_id, "images": imgs, "notes": notes},
                     "status!=none", "continue", None, "Decide likely fault.")
 
-        if steps_done == 3:
-            analysis   = hints.get("analysis") or {}
-            reasonable = bool(analysis.get("refund_reasonable"))
-            fault      = (analysis.get("fault") or "").lower()
-            conf       = float(analysis.get("confidence") or 0.0)
-            if reasonable and conf >= 0.55:
+        # Step 4: Issue a refund if the analysis supports it.
+        if steps_done == 4:
+            analysis = hints.get("analysis") or {}
+            if bool(analysis.get("refund_reasonable")) and float(analysis.get("confidence", 0.0)) >= 0.55:
                 return ("refund customer", "issue_instant_refund",
                         {"order_id": order_id},
                         "refunded==true", "continue", None, "Goodwill refund.")
-            msg = ("After reviewing the photos, we don’t see sufficient evidence to issue a refund right now. "
-                "If you have additional photos or context, please reply here.")
-            return ("notify no refund", "notify_customer",
-                    {"fcm_token": hints.get("customer_token") or DEFAULT_CUSTOMER_TOKEN,
-                    "message": msg, "voucher": False, "title": "Damage Assessment"},
-                    "delivered==true", "final", "Customer informed.", "No refund.")
-
-        # Step 5: Exonerate the driver if the merchant was at fault
-        if steps_done == 4: 
-            analysis = hints.get("analysis", {})
-            # Only exonerate if the fault is clearly on the merchant
-            if analysis.get("fault") == "merchant":
-                return ("exonerate driver", "exonerate_driver", 
-                        {"driver_id": driver_id}, "cleared==true",
-                        "continue", None, "Merchant found at fault; clearing driver.")
-            # IMPORTANT: For all other cases, continue to the next step instead of stopping.
-            return ("skip exoneration", "none", {}, None, "continue", None, "Fault not assigned to the merchant.")
-
+            
+            return ("skip refund", "noop", {}, None, "continue", None, "No refund required.")
+        
+        # Step 5: Exonerate the driver.
         if steps_done == 5:
-            analysis = hints.get("analysis") or {}
-            if (analysis.get("fault") or "").lower() == "merchant":
-                fb = analysis.get("packaging_feedback") or \
-                    "Evidence-backed report: seal/leakage suggests packaging issue."
+            analysis = hints.get("analysis", {})
+            if analysis.get("fault") != "driver":
+                return ("exonerate driver", "exonerate_driver",
+                        {"driver_id": driver_id}, "cleared==true",
+                        "continue", None, "Exonerating driver.")
+            return ("skip driver exoneration", "noop", {}, None, "continue", None, "No driver exoneration required.")
+
+        # Step 6: Log merchant packaging feedback.
+        if steps_done == 6:
+            analysis = hints.get("analysis", {})
+            if bool(analysis.get("refund_reasonable")):
+                fb = analysis.get("packaging_feedback") or "Evidence-backed report: seal/leakage suggests packaging issue."
                 return ("feedback to merchant", "log_merchant_packaging_feedback",
                         {"merchant_id": merchant_id, "feedback": fb},
-                        "feedbacklogged==true", "continue", None, "Log packaging issue.")
-            return ("done", "none", {}, None, "final", "Resolution sent.", "No merchant feedback required.")
+                        "feedbackLogged==true", "continue", None, "Log packaging issue.")
+            return ("skip merchant feedback", "noop", {}, None, "continue", None, "No merchant feedback required.")
 
-        # Step 7 (or the final step in your sequence): Communicate final resolution to both parties
-        if steps_done == 6: # Adjust step number if needed
+        # Step 7: Final notification to the customer about the resolution.
+        if steps_done == 7:
+            refunded = hints.get("refunded", False)
+            if refunded:
+                msg = "A full refund has been issued for your order. We apologize for the damage."
+            else:
+                msg = "After reviewing the photos, we don’t see sufficient evidence to issue a refund right now. If you have additional photos or context, please reply here."
+                
             return (
-                "notify resolution", "tool_notify_resolution", 
+                "notify resolution", "notify_customer",
                 {
-                    "driver_token": hints.get("driver_token"), 
-                    "customer_token": hints.get("customer_token"), 
-                    "message": "The damage dispute has been resolved. A refund has been issued."
-                }, 
-                None, "final", "Resolution communicated to all parties.", "Finalizing the dispute."
+                    "fcm_token": hints.get("customer_token") or DEFAULT_CUSTOMER_TOKEN,
+                    "title": "Dispute Resolution",
+                    "message": msg,
+                    "voucher": False,
+                },
+                "delivered==true", "final", "Resolution communicated to customer.", "Finalizing the dispute."
             )
-        return None
-    # ---------------------------------------------------------------------
-    #  recipient_unavailable  → safe-drop? → choose locker → notify
-    # ---------------------------------------------------------------------
+        
     if kind == "recipient_unavailable":
         answers = hints.get("answers") or {}
         lockers = hints.get("lockers")                 # filled after tool runs
@@ -1817,13 +1864,19 @@ def _policy_next_extended(kind: str, steps_done: int, hints: Dict[str, Any]) -> 
         # 4 ▸ locker chosen → send confirmation push
         if chosen:
             locker_id = hints["meta"]["locker_ids"].get(chosen, chosen)
+            locker_name = ""
+            # Look up the locker name from the list of found lockers
+            for locker in (hints.get("lockers") or []):
+                if locker.get("id") == locker_id:
+                    locker_name = locker.get("name")
+                    break
             return (
                 "notify", "notify_customer",
                 {
                     "fcm_token": hints.get("customer_token") or DEFAULT_CUSTOMER_TOKEN,
                     "title": "Package secured",
                     "message": (f"Your parcel has been placed in locker "
-                                f"{locker_id}. Pick-up code sent via SMS/Email."),
+                                f"{locker_name}. Pick-up code sent via SMS/Email."),
                     "voucher": False,
                 },
                 "delivered==true",
@@ -1873,9 +1926,6 @@ def _policy_next_extended(kind: str, steps_done: int, hints: Dict[str, Any]) -> 
             "Awaiting recipient guidance (no location for lockers).",
             "Notify customer due to insufficient data.",
         )
-
-    # Unknown/other kinds: stop after classification
-    return None
 
 # ----------------------------- AGENT -----------------------------------
 class SynapseAgent:
@@ -1944,7 +1994,7 @@ class SynapseAgent:
             hints.update({k: v for k, v in rhints.items() if k in ("origin","dest","origin_place","dest_place")})
 
         while steps < MAX_STEPS and (time.time() - t0) < MAX_SECONDS:
-            step = _policy_next_extended(kind, steps, hints)
+            step = _policy_next_extended(kind, steps, hints, sid)
             if not step:
                 break
 
@@ -1959,31 +2009,47 @@ class SynapseAgent:
                     fn = TOOLS.get(tool, {}).get("fn")
                     if callable(fn):
                         obs = fn(**(params or {}))
+
+                        # ── cache lockers ─────────────────────────────
                         if tool in ("find_nearby_locker", "places_search_nearby") and isinstance(obs, dict):
                             if obs.get("lockers"):
                                 hints["lockers"] = obs["lockers"]
-                        if tool == "get_nearby_merchants" and obs.get("merchants"):
-                            hints["merchants"] = obs["merchants"]
-                        session["hints"]  = hints  
+
+                        # ── cache merchants ───────────────────────────
+                        if tool == "get_nearby_merchants" and isinstance(obs, dict):
+                            if obs.get("merchants"):
+                                hints["merchants"] = obs["merchants"]
+
+                        # ── stash outputs for later checks ────────────
                         if tool not in ("none", "ask_user") and isinstance(obs, dict):
-                            # stash key outputs for later policy checks
                             if tool == "analyze_evidence":
-                                # persist for the rest of the run (and resume)
                                 hints["analysis"] = obs
-                        # ---- side effects we need for later policy steps ----
+
+                        # ── side effects ─────────────────────────────
                         if tool == "collect_evidence" and isinstance(obs, dict):
                             files = obs.get("files")
                             if files:
                                 a = hints.get("answers") or {}
                                 a["evidence_images"] = files
                                 hints["answers"] = a
+
                         if tool == "analyze_evidence" and isinstance(obs, dict):
-                            # keep last analysis for refund/decline branches
                             hints["analysis"] = obs
+
+                        # ✅ persist to your own run-session (NOT flask.session)
+                        sess = _session_load(sid) or {}
+                        sess["scenario"] = scenario
+                        sess["hints"] = hints
+                        sess["steps_done"] = steps
+                        sess["kind"] = kind
+                        _session_save(sid, sess)
+
                     else:
                         obs = {"error": f"tool_not_found_or_not_callable:{tool}"}
+
                 except Exception as e:
                     obs = {"error": str(e), "trace": traceback.format_exc()}
+
             try:
                 if tool == "collect_evidence":
                     # remember saved files (if tool returned them)
@@ -2532,21 +2598,22 @@ def _sse_headers():
         "X-Accel-Buffering": "no",
     }
 
-@app.route("/api/agent/clarify/continue", methods=["GET","POST","OPTIONS"])
+# /api/agent/clarify/continue  — single, final copy
+# Corrected clarify_continue endpoint
+@app.route("/api/agent/clarify/continue", methods=["GET", "POST", "OPTIONS"])
 @require_auth
 def clarify_continue():
-    # accept both GET (EventSource) and POST
     if request.method == "GET":
-        sid      = (request.args.get("session_id")  or "").strip()
-        qid      = (request.args.get("question_id") or "").strip()
-        expected = (request.args.get("expected")    or "text").strip()
-        raw      = request.args.get("answer") or ""
+        sid = (request.args.get("session_id") or "").strip()
+        qid = (request.args.get("question_id") or "").strip()
+        expected = (request.args.get("expected") or "string").strip()
+        raw = request.args.get("answer") or ""
     else:
-        data     = request.get_json(force=True) or {}
-        sid      = (data.get("session_id")  or "").strip()
-        qid      = (data.get("question_id") or "").strip()
-        expected = (data.get("expected")    or "text").strip()
-        raw      = data.get("answer", "")
+        data = request.get_json(force=True) or {}
+        sid = (data.get("session_id") or "").strip()
+        qid = (data.get("question_id") or "").strip()
+        expected = (data.get("expected") or "string").strip()
+        raw = data.get("answer", "")
 
     if not sid or not qid:
         return jsonify({"error": "missing session_id or question_id"}), 400
@@ -2556,22 +2623,55 @@ def clarify_continue():
         return jsonify({"error": "invalid_or_expired_session"}), 404
 
     scenario = sess["scenario"]
-    hints    = dict(sess.get("hints") or {})
+    hints = dict(sess.get("hints") or {})
     start_at = int(sess.get("steps_done", 0))
 
+    # Normalize and store the answer
     answers = dict(hints.get("answers") or {})
-    answers[qid] = _parse_answer(raw, expected)
+    val = _parse_answer(raw, expected)
+
+    # Accept {label,value} or {name} from UI libs
+    if isinstance(val, dict):
+        val = val.get("value") or val.get("label") or val.get("name") or ""
+
+    # Allow numeric indexes too
+    if isinstance(val, (int, float)):
+        try:
+            val = str(int(val))
+        except Exception:
+            val = str(val)
+
+    if isinstance(val, str) and val.strip().lower() in ("", "null", "none"):
+        val = None
+
+    answers[qid] = val
     hints["answers"] = answers
+
+    # The bug: `start_at` should not be incremented here. The `resolve_stream`
+    # function handles this logic internally.
+    # The fix is to remove `start_at += 1`
+    
+    # Persist the updated session
+    sess["hints"] = hints
+    _session_save(sid, sess)
 
     def generate():
         try:
-            for evt in agent.resolve_stream(scenario, hints=hints,
-                                            session_id=sid, start_at_step=start_at, resume=True):
+            for evt in agent.resolve_stream(
+                scenario,
+                hints=hints,
+                session_id=sid,
+                start_at_step=start_at,
+                resume=True,
+            ):
                 yield sse(evt)
             yield sse("[DONE]")
         except Exception as e:
-            yield sse({"type":"error","at":now_iso(),
-                      "data":{"message":str(e),"trace":traceback.format_exc()}})
+            yield sse({
+                "type": "error",
+                "at": now_iso(),
+                "data": {"message": str(e), "trace": traceback.format_exc()}
+            })
             yield sse("[DONE]")
 
     return Response(generate(), headers=_sse_headers())

@@ -85,4 +85,4 @@ export const CFG = {
 export const firebaseConfig = CFG.FIREBASE;
 export const VAPID_PUBLIC_KEY = CFG.FCM.VAPID_PUBLIC_KEY;
 export const MAPS_BROWSER_KEY = CFG.MAPS_BROWSER_KEY;
-export const API_BASE = CFG.API_BASE;
+export const API_BASE = "http://127.0.0.1:5000";

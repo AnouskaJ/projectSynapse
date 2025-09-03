@@ -1,3 +1,5 @@
+// src/components/AgentStream/index.jsx
+
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
@@ -14,6 +16,7 @@ import MapBox from "./MapBox";
 import StepItem from "./StepItem";
 import ViewToggle from "./ViewToggle";
 import ImageAnswer from "./ImageAnswer";
+import AltRoutesMap from "./AltRoutesMap";
 
 /* Fade-in animation keyframes (one-time inject) */
 if (!document.getElementById("fadeInUpKeyframes")) {
@@ -35,17 +38,21 @@ export default function AgentStream({ scenarioText }) {
   const [followLive, setFollowLive] = useState(true);
   const esRef = useRef(null);
 
-  /* Clarify & push-notification related */
+  // clarify
   const [sessionId, setSessionId] = useState("");
   const [clarify, setClarify] = useState(null);
   const [answerDraft, setAnswerDraft] = useState("");
+
+  // FCM
   const [fcmSupported, setFcmSupported] = useState(false);
   const [fcmToken, setFcmToken] = useState("");
   const [notifPermission, setNotifPermission] = useState(Notification?.permission ?? "default");
 
-  const previewUrl = scenarioText ? `${API_BASE}/api/agent/run?${new URLSearchParams({ scenario: scenarioText })}` : "";
+  const previewUrl = scenarioText
+    ? `${API_BASE}/api/agent/run?${new URLSearchParams({ scenario: scenarioText }).toString()}`
+    : "";
 
-  /* ───────────── bootstrap Web-Push (once) ───────────── */
+  /* ── push bootstrap ── */
   useEffect(() => {
     let off = () => {};
     (async () => {
@@ -59,14 +66,13 @@ export default function AgentStream({ scenarioText }) {
 
       const messaging = getMessaging(app);
       off = onMessage(messaging, async (payload) => {
-        if (Notification.permission !== "granted") return;
-        const swr = (await navigator.serviceWorker.getRegistration()) || reg;
-        swr?.showNotification(payload?.notification?.title ?? "Notification", {
-          body: payload?.notification?.body ?? "",
-          data: payload?.data ?? {},
-          tag: payload?.messageId,
-          requireInteraction: true,
-        });
+        if (Notification.permission === "granted") {
+          const title = payload?.notification?.title || "Notification";
+          const body = payload?.notification?.body || "";
+          const data = payload?.data || {};
+          const swr = (await navigator.serviceWorker.getRegistration()) || reg;
+          swr?.showNotification(title, { body, data, tag: payload?.messageId, requireInteraction: true });
+        }
       });
     })();
     return () => off();
@@ -76,9 +82,11 @@ export default function AgentStream({ scenarioText }) {
     if (Notification?.permission === "granted") ensureFreshFcmToken().then((t) => t && setFcmToken(t));
   }, []);
 
-  /* ───────────── SSE helpers ───────────── */
+  /* ── SSE helpers ── */
   const closeStream = () => {
-    esRef.current?.close?.();
+    try {
+      esRef.current?.close?.();
+    } catch {}
     esRef.current = null;
   };
 
@@ -95,23 +103,21 @@ export default function AgentStream({ scenarioText }) {
     try {
       const payload = JSON.parse(line);
 
-      /* session / clarify handling */
+      // session id
       if (payload?.type === "session" && payload?.data?.session_id) setSessionId(payload.data.session_id);
       if (payload?.type === "clarify" && payload?.data?.session_id) setSessionId(payload.data.session_id);
 
-      /* auto-rotate FCM token on UNREGISTERED */
+      // auto-rotate FCM token on UNREGISTERED
+      const err = payload?.data?.observation?.error;
       const errCode =
-        payload?.data?.observation?.error?.errorCode ||
-        (typeof payload?.data?.observation?.error === "object" &&
-        JSON.stringify(payload.data.observation.error).includes('"UNREGISTERED"')
-          ? "UNREGISTERED"
-          : null);
+        err?.errorCode ||
+        (typeof err === "object" && JSON.stringify(err).includes('"UNREGISTERED"') ? "UNREGISTERED" : null);
       if (errCode === "UNREGISTERED") {
         const t = await refreshFcmToken();
         if (t) setFcmToken(t);
       }
 
-      /* clarify UI */
+      // clarify panel
       if (payload?.type === "clarify") {
         setClarify(payload.data || null);
         setStatus("awaiting");
@@ -119,7 +125,7 @@ export default function AgentStream({ scenarioText }) {
 
       setEvents((p) => [...p, payload]);
     } catch {
-      /* ignore SSE keep-alive ping */
+      /* ignore ping */
     }
   };
 
@@ -134,7 +140,7 @@ export default function AgentStream({ scenarioText }) {
     };
   };
 
-  /* ───────────── controls: start / stop ───────────── */
+  /* ── start / stop ── */
   const start = async () => {
     if (!scenarioText) return;
     closeStream();
@@ -152,11 +158,19 @@ export default function AgentStream({ scenarioText }) {
       if (Notification && Notification.permission !== "granted") {
         const perm = await Notification.requestPermission();
         setNotifPermission(perm);
-        if (perm !== "granted") throw new Error("Enable notifications to receive FCM pushes.");
+        if (perm !== "granted") {
+          setStatus("error");
+          setError("Enable notifications to receive FCM pushes.");
+          return;
+        }
       }
 
       const liveTok = (await ensureFreshFcmToken()) || fcmToken;
-      if (!liveTok) throw new Error("Could not obtain FCM token.");
+      if (!liveTok) {
+        setStatus("error");
+        setError("Could not obtain FCM token.");
+        return;
+      }
       if (liveTok !== fcmToken) setFcmToken(liveTok);
 
       const url = await buildRunUrl({
@@ -168,7 +182,7 @@ export default function AgentStream({ scenarioText }) {
       wireSSE(url);
     } catch (e) {
       setStatus("error");
-      setError(e.message ?? "Failed to start stream");
+      setError(e.message || "Failed to start stream");
     }
   };
 
@@ -179,7 +193,6 @@ export default function AgentStream({ scenarioText }) {
     setFollowLive(false);
   };
 
-  /* Resume after clarification ------------------------------------------ */
   const resumeWithAnswer = async (answer) => {
     if (!sessionId) return setError("Missing session id");
     closeStream();
@@ -188,33 +201,35 @@ export default function AgentStream({ scenarioText }) {
       const liveTok = fcmToken || (await ensureFreshFcmToken());
       if (liveTok && liveTok !== fcmToken) setFcmToken(liveTok);
 
-      const ans = clarify?.question_id ? { [clarify.question_id]: answer } : {};
+      const qs = new URLSearchParams();
+      qs.set("session_id", sessionId);
+      qs.set("question_id", clarify?.question_id);
+      qs.set("answer", answer); // Correctly set the single answer parameter
+
+      if (liveTok) {
+        qs.set("passenger_token", liveTok);
+        qs.set("customer_token", liveTok);
+        qs.set("driver_token", liveTok);
+      }
+      
+      wireSSE(`${API_BASE}/api/agent/clarify/continue?${qs}`);
       setClarify(null);
       setAnswerDraft("");
-      const qs = new URLSearchParams({
-      session_id: sessionId,
-      question_id: clarify.question_id,
-      expected: clarify.expected || "text",
-      answer: Array.isArray(answer) ? JSON.stringify(answer) : String(answer),
-      passenger_token: liveTok,
-      customer_token: liveTok,
-    });
-    wireSSE(`${API_BASE}/api/agent/clarify/continue?${qs}`);
     } catch (e) {
       setStatus("error");
-      setError(e.message ?? "Failed to resume");
+      setError(e.message || "Failed to resume");
     }
   };
 
-  /* ───────────── derived memo data ───────────── */
+  /* ── derive data ── */
   const classification = useMemo(() => events.find((e) => e.type === "classification")?.data, [events]);
   const steps = useMemo(() => events.filter((e) => e.type === "step").map((e) => ({ ...e.data, ts: e.at })), [events]);
   const summaryEvt = useMemo(() => events.find((e) => e.type === "summary")?.data, [events]);
 
-  /* latest map payload */
+  // live map payload (most recent)
   const mapPayload = useMemo(() => {
     if (!steps.length) return null;
-    const idx = activeIndex >= 0 ? activeIndex : steps.length - 1;
+    let idx = activeIndex >= 0 ? activeIndex : steps.length - 1;
     for (let i = idx; i >= 0; i--) {
       const m = steps[i]?.observation?.map;
       if (m) return m;
@@ -231,44 +246,42 @@ export default function AgentStream({ scenarioText }) {
     const stepsCount = summaryEvt?.metrics?.steps;
     const outcome = summaryEvt?.outcome;
     const lastMsg = steps.length ? steps.at(-1)?.final_message || steps.at(-1)?.finalMessage : "";
-    return [
-      outcome && `Outcome: ${outcome}`,
-      typeof stepsCount === "number" && `${stepsCount} step${stepsCount === 1 ? "" : "s"}`,
-      kind && `Kind: ${kind}${sev ? ` (${sev})` : ""}`,
-      lastMsg,
-    ]
-      .filter(Boolean)
-      .join(" • ");
+    const bits = [];
+    if (outcome) bits.push(`Outcome: ${outcome}`);
+    if (typeof stepsCount === "number") bits.push(`${stepsCount} step${stepsCount === 1 ? "" : "s"}`);
+    if (kind) bits.push(`Kind: ${kind}${sev ? ` (${sev})` : ""}`);
+    if (lastMsg) bits.push(lastMsg);
+    return bits.join(" • ");
   }, [summaryEvt, classification, steps]);
 
-  /* follow-live & play-through ------------------------------------------- */
+  /* follow-live / play-through */
   useEffect(() => {
     if (followLive && steps.length) setActiveIndex(steps.length - 1);
   }, [steps.length, followLive]);
-
   useEffect(() => {
     if (!isPlaying) return;
     const id = setInterval(() => setActiveIndex((i) => Math.min((i ?? -1) + 1, steps.length - 1)), 900);
     return () => clearInterval(id);
   }, [isPlaying, steps.length]);
-
   useEffect(() => {
     if (activeIndex < 0) return;
-    document.getElementById(`step-${activeIndex}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    const el = document.getElementById(`step-${activeIndex}`);
+    el?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [activeIndex]);
 
   /* ───────────── GUI view ───────────── */
   const GUIView = (
     <div className="space-y-6">
-      {/* Push status */}
+      {/* push status */}
       <div className="card p-4 flex items-center justify-between gap-4">
         <div className="text-sm">
           <div className="font-medium mb-1">Push Delivery</div>
           <div className="text-gray-400">
-            {fcmSupported ? "Web Push is supported" : "Web Push not supported"} • Permission: <strong>{notifPermission}</strong>
+            {fcmSupported ? "Web Push is supported" : "Web Push not supported"}{" • "}
+            Permission: <strong>{notifPermission}</strong>
             {fcmToken && (
               <>
-                {" • "}Token:{" "}
+                {" • "} Token:{" "}
                 <code className="text-xs">
                   {fcmToken.slice(0, 12)}…{fcmToken.slice(-8)}
                 </code>
@@ -278,25 +291,42 @@ export default function AgentStream({ scenarioText }) {
         </div>
       </div>
 
-      {/* Live map */}
+      {/* live map */}
       <div className="card p-4">
         <div className="flex items-center justify-between mb-2">
           <div className="text-sm uppercase tracking-wider text-gray-400">Map</div>
-          <Pill tone={mapPayload ? "ok" : "warn"}>{mapPayload ? "live" : "no data"}</Pill>
+          <Pill tone={mapPayload ? "ok" : "warn"}>
+            {mapPayload ? "live" : "no data"}
+          </Pill>
         </div>
         {mapPayload ? (
-          <MapBox payload={mapPayload} />
+          mapPayload.kind === "directions" &&
+          (mapPayload.routes?.length ?? 0) > 0 ? (
+            <AltRoutesMap
+              routes={mapPayload.routes}
+              bounds={mapPayload.bounds}
+            />
+          ) : (
+            <MapBox payload={mapPayload} />
+          )
         ) : (
-          <div className="text-gray-400">No map data yet. Run a scenario that calls tools like traffic or alternates.</div>
+          <div className="text-gray-400">
+            No map data yet. Run a scenario that calls tools like traffic,
+            alternates, or places.
+          </div>
         )}
       </div>
 
-      {/* Classification */}
+      {/* classification */}
       {classification && (
         <div className="card p-5">
           <div className="flex items-center justify-between mb-2">
-            <div className="text-sm uppercase tracking-wider text-gray-400">Classification</div>
-            <Pill tone={classification.kind === "unknown" ? "warn" : "ok"}>{classification.kind}</Pill>
+            <div className="text-sm uppercase tracking-wider text-gray-400">
+              Classification
+            </div>
+            <Pill tone={classification.kind === "unknown" ? "warn" : "ok"}>
+              {classification.kind}
+            </Pill>
           </div>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
             <div>
@@ -311,26 +341,38 @@ export default function AgentStream({ scenarioText }) {
         </div>
       )}
 
-      {/* Chain-of-thought list */}
-      {steps.length > 0 && (
+      {/* chain of thought */}
+      {(steps?.length ?? 0) > 0 && (
         <section className="card p-5">
-          <div className="text-sm uppercase tracking-wider text-gray-400 mb-3">Chain of Thought</div>
+          <div className="text-sm uppercase tracking-wider text-gray-400 mb-3">
+            Chain of Thought
+          </div>
           <div className="relative">
-            {steps.map((s, i) => (
-              <StepItem key={s.index ?? i} step={s} index={i} active={i === activeIndex} complete={i <= activeIndex} />
+            {(steps || []).map((s, i) => (
+              <StepItem
+                key={s.index ?? i}
+                step={s}
+                index={i}
+                active={i === activeIndex}
+                complete={i <= activeIndex}
+              />
             ))}
           </div>
         </section>
       )}
 
-      {/* Clarification panel */}
+      {/* clarify panel */}
       {clarify && (
         <div className="card p-5 border-amber-800 bg-amber-950/30">
           <div className="flex items-center justify-between mb-2">
-            <div className="text-sm uppercase tracking-wider text-amber-300">Clarification needed</div>
+            <div className="text-sm uppercase tracking-wider text-amber-300">
+              Clarification needed
+            </div>
             <Pill tone="warn">awaiting</Pill>
           </div>
-          <div className="text-gray-200 mb-3">{clarify.question || "Please provide more info."}</div>
+          <div className="text-gray-200 mb-3">
+            {clarify.question || "Please provide more info."}
+          </div>
 
           {clarify.expected === "image[]" ? (
             <ImageAnswer
@@ -340,7 +382,10 @@ export default function AgentStream({ scenarioText }) {
                 fd.append("session_id", sessionId);
                 fd.append("question_id", clarify.question_id);
                 Array.from(fileList).forEach((f) => fd.append("images", f));
-                const up = await fetch(`${API_BASE}/api/evidence/upload`, { method: "POST", body: fd });
+                const up = await fetch(`${API_BASE}/api/evidence/upload`, {
+                  method: "POST",
+                  body: fd,
+                });
                 const { files = [] } = await up.json();
 
                 setClarify(null);
@@ -357,20 +402,30 @@ export default function AgentStream({ scenarioText }) {
                 wireSSE(url);
               }}
             />
-          ) : Array.isArray(clarify.options) && clarify.options.length ? (
+          ) : Array.isArray(clarify.options) && clarify.options.length > 0 ? (
             <div className="flex flex-wrap gap-2">
               {clarify.options.map((opt) => (
-                <button key={opt} className="btn btn-primary" onClick={() => resumeWithAnswer(opt)}>
+                <button
+                  key={opt}
+                  className="btn btn-primary"
+                  onClick={() => resumeWithAnswer(opt)}
+                >
                   {String(opt)}
                 </button>
               ))}
             </div>
           ) : clarify.expected === "boolean" ? (
             <div className="flex gap-2">
-              <button className="btn btn-primary" onClick={() => resumeWithAnswer("yes")}>
+              <button
+                className="btn btn-primary"
+                onClick={() => resumeWithAnswer("yes")}
+              >
                 Yes
               </button>
-              <button className="btn btn-ghost" onClick={() => resumeWithAnswer("no")}>
+              <button
+                className="btn btn-ghost"
+                onClick={() => resumeWithAnswer("no")}
+              >
                 No
               </button>
             </div>
@@ -381,15 +436,24 @@ export default function AgentStream({ scenarioText }) {
                 placeholder="Type your answer…"
                 value={answerDraft}
                 onChange={(e) => setAnswerDraft(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && resumeWithAnswer(answerDraft)}
+                onKeyDown={(e) =>
+                  e.key === "Enter" && resumeWithAnswer(answerDraft)
+                }
               />
-              <button className="btn btn-primary" onClick={() => resumeWithAnswer(answerDraft)}>
+              <button
+                className="btn btn-primary"
+                onClick={() => resumeWithAnswer(answerDraft)}
+              >
                 Send
               </button>
             </div>
           )}
 
-          {clarify.options?.length > 0 && <div className="mt-3 text-sm text-gray-400">Options: {clarify.options.join(" / ")}</div>}
+          {clarify.options?.length > 0 && (
+            <div className="mt-3 text-sm text-gray-400">
+              Options: {clarify.options.join(" / ")}
+            </div>
+          )}
           {sessionId && (
             <div className="mt-2 text-xs text-gray-500">
               session: <code>{sessionId}</code>
@@ -398,12 +462,22 @@ export default function AgentStream({ scenarioText }) {
         </div>
       )}
 
-      {/* Summary */}
+      {/* summary */}
       {summaryEvt && (
         <div className="card p-5">
           <div className="flex items-center justify-between mb-2">
-            <div className="text-sm uppercase tracking-wider text-gray-400">Summary</div>
-            <Pill tone={summaryEvt.outcome === "resolved" ? "ok" : summaryEvt.outcome === "escalated" ? "warn" : "neutral"}>
+            <div className="text-sm uppercase tracking-wider text-gray-400">
+              Summary
+            </div>
+            <Pill
+              tone={
+                summaryEvt.outcome === "resolved"
+                  ? "ok"
+                  : summaryEvt.outcome === "escalated"
+                  ? "warn"
+                  : "neutral"
+              }
+            >
               {summaryEvt.outcome || "—"}
             </Pill>
           </div>
@@ -414,7 +488,8 @@ export default function AgentStream({ scenarioText }) {
 
           {sessionId && summaryEvt.outcome === "await_input" && (
             <div className="mt-2 text-xs text-gray-500">
-              Awaiting response. Session <code>{sessionId}</code> will resume when you answer above.
+              Awaiting response. Session <code>{sessionId}</code> will resume
+              when you answer above.
             </div>
           )}
         </div>
@@ -426,7 +501,11 @@ export default function AgentStream({ scenarioText }) {
   const CLIView = (
     <div className="card p-4">
       <div className="text-xs text-gray-400 mb-2">Raw SSE</div>
-      <pre className="cli">{rawLines.map((l, i) => `[${(i + 1).toString().padStart(3, "0")}] ${l}`).join("\n")}</pre>
+      <pre className="cli">
+        {rawLines
+          .map((l, i) => `[${(i + 1).toString().padStart(3, "0")}] ${l}`)
+          .join("\n")}
+      </pre>
     </div>
   );
 
@@ -434,10 +513,18 @@ export default function AgentStream({ scenarioText }) {
   return (
     <div className="space-y-4">
       <div className="flex gap-3 items-center flex-wrap">
-        <button className="btn btn-primary" onClick={start} disabled={!scenarioText || status === "streaming"}>
+        <button
+          className="btn btn-primary"
+          onClick={start}
+          disabled={!scenarioText || status === "streaming"}
+        >
           {status === "streaming" ? "Streaming…" : "Run Scenario"}
         </button>
-        <button className="btn btn-ghost" onClick={stop} disabled={status !== "streaming"}>
+        <button
+          className="btn btn-ghost"
+          onClick={stop}
+          disabled={status !== "streaming"}
+        >
           Stop
         </button>
         <div className="text-sm text-gray-400 self-center hidden md:block">
@@ -447,7 +534,9 @@ export default function AgentStream({ scenarioText }) {
         <ViewToggle mode={mode} setMode={setMode} />
       </div>
 
-      {error && <div className="card border-rose-800 bg-rose-950/40 p-3">{error}</div>}
+      {error && (
+        <div className="card border-rose-800 bg-rose-950/40 p-3">{error}</div>
+      )}
       {mode === "gui" ? GUIView : CLIView}
     </div>
   );

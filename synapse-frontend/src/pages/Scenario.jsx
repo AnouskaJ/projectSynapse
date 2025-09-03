@@ -18,7 +18,7 @@ const DEFAULTS = {
   },
   grabcar: {
     title: "GrabCar",
-    scenario: "An urgent airport ride from SRMIST to Chennai International Airport (MAA) for flight 6E 5119. A major accident is blocking the main route. Find the fastest alternative and inform both passenger and driver."
+    scenario: "An urgent airport ride from SRMIST Chennai to Chennai International Airport (MAA) for flight 6E 5119. A major accident is blocking the main route. Find the fastest alternative and inform both passenger and driver."
   },
   custom: {
     title: "Custom",

@@ -1,4 +1,3 @@
-/* src/components/AgentStream/StepItem.jsx */
 import React, { useState, useMemo, lazy, Suspense } from "react";
 import Pill from "./Pill";
 import PrettyObject, { K } from "./PrettyObject";
@@ -19,7 +18,7 @@ const buildEmbed = (m, p = {}) => {
     m.dest_place || m.dest_any || "";
   if (!origin || !dest || !MAPS_BROWSER_KEY) return null;
 
-  const mode = (p.mode || m.mode || "DRIVING").toLowerCase();
+  const mode = (p.mode || p.travel_mode || m.mode || "DRIVING").toLowerCase();
   return (
     "https://www.google.com/maps/embed/v1/directions" +
     `?key=${encodeURIComponent(MAPS_BROWSER_KEY)}` +
@@ -41,45 +40,47 @@ export default function StepItem({ step, index, active = false, complete = false
   };
 
   /* -------- decide what to render as `mapElement` -------- */
-  const mapElement = useMemo(() => {
+const mapElement = useMemo(() => {
+  const m = step?.observation?.map;
+  const isAltCalc      = step.tool === "calculate_alternative_route";
+  const isCheckTraffic = step.tool === "check_traffic";
 
-    const isAltCalc     = step.tool === "calculate_alternative_route";
-    const isCheckTraffic = step.tool === "check_traffic";
+  // ── calculate_alternative_route → show all alternatives ──
+  if (isAltCalc && m?.kind === "directions" && m?.routes?.length) {
+    return (
+      <Suspense fallback={<div className="h-96 w-full bg-black/20" />}>
+        <AltRoutesMap routes={m.routes} bounds={m.bounds} />
+      </Suspense>
+    );
+  }
 
-    /* ── calculate_alternative_route → show all alternatives ── */
-    if (isAltCalc && m.kind === "directions" && m.routes?.length) {
-      return (
-        <Suspense fallback={<div className="h-96 w-full bg-black/20" />}>
-          {/* showAlternatives defaults to true ⇒ full list & coloured lines */}
-          <AltRoutesMap routes={m.routes} />
-        </Suspense>
-      );
-    }
-
-    /* ── check_traffic → simple Google embed (single blue line) ── */
-    if (isCheckTraffic) {
-      const url = m.embedUrl || buildEmbed(m, step.params);
-      return url ? <StepEmbedMap url={url} /> : null;
-    }
-    if (step.tool === "get_nearby_merchants" && step.observation?.merchants?.length) {
-      const merchants = step.observation.merchants;
-      const center = { lat: merchants[0].lat, lng: merchants[0].lng ?? merchants[0].lon };
-      return (
-        <Suspense fallback={<div className="h-96 w-full bg-black/20" />}>
-          <MerchantMap center={center} merchants={merchants} />
-        </Suspense>
-      );
-    }
-
-    const m = step?.observation?.map;
-    if (!m) return null;
-   
-    /* ── all other tools ── */
-    if (m.embedUrl) return <StepEmbedMap url={m.embedUrl} />;
- 
-    const url = buildEmbed(m, step.params);
+  // ── check_traffic → prefer server-provided embedUrl; else build from params ──
+  if (isCheckTraffic) {
+    const url =
+      m?.embedUrl ||
+      buildEmbed(m || {}, step?.params || {});
     return url ? <StepEmbedMap url={url} /> : null;
-  }, [step]);
+  }
+
+  // Nearby merchants map
+  if (step.tool === "get_nearby_merchants" && step.observation?.merchants?.length) {
+    const merchants = step.observation.merchants;
+    const center = { lat: merchants[0].lat, lng: merchants[0].lng ?? merchants[0].lon };
+    return (
+      <Suspense fallback={<div className="h-96 w-full bg-black/20" />}>
+        <MerchantMap center={center} merchants={merchants} />
+      </Suspense>
+    );
+  }
+
+  if (!m) return null;
+
+  // All other tools
+  if (m?.embedUrl) return <StepEmbedMap url={m.embedUrl} />;
+
+  const url = buildEmbed(m, step?.params || {});
+  return url ? <StepEmbedMap url={url} /> : null;
+}, [step]);
 
   /* ------------------- JSX layout ------------------- */
   return (
