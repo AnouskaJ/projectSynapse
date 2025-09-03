@@ -1,206 +1,196 @@
-# 🚖 GrabHack – Real-Time Agentic Last-Mile Coordinator
+Here’s a polished README.md draft for your Synapse: AI-Powered Logistics Coordinator project:
 
-GrabHack is an end-to-end prototype that demonstrates how **AI agents, real-time streams, and Google APIs** can coordinate last-mile delivery scenarios. It simulates real-world cases like package disputes, restaurant delays, and recipient unavailability, while keeping the customer, driver, and merchant informed via **push notifications and clarification flows**.
-
----
-
-## ✨ Features
-
-* **Agentic Orchestration**
-  AI agent resolves delivery scenarios step-by-step using a planner–executor loop.
-
-* **Interactive Clarification**
-  Agent pauses to ask human input (e.g., “Safe drop allowed?”, “Choose alternate restaurant”).
-
-* **Push Notifications via FCM**
-  Driver, passenger, and customer receive live updates.
-
-* **Google Maps / Places Integration**
-
-  * 📍 Nearby parcel lockers (`places:searchNearby`)
-  * 🍴 Nearby restaurants (`place/nearbysearch`)
-  * 🚦 Traffic-aware ETAs (`directions` with traffic model)
-  * 🗺️ Embedded maps with pins and directions
-
-* **Frontend (React + Vite)**
-
-  * `AgentStream` component renders live steps (SSE).
-  * Clarification UI with buttons / file uploads.
-  * Interactive maps (`StepEmbedMap`, `MerchantMap`, `AltRoutesMap`).
-
-* **Backend (Flask + Python)**
-
-  * `/api/agent/run` → SSE endpoint for agent streams.
-  * `/api/agent/clarify/continue` → resumes sessions after input.
-  * `/api/evidence/upload` → handle image evidence (e.g. damage disputes).
-  * Tool functions (`tool_find_nearby_locker`, `tool_get_nearby_merchants`, `tool_check_traffic`, …).
 
 ---
 
-## 🏗️ Architecture
+🚚 Synapse: AI-Powered Logistics Coordinator
 
-```mermaid
-flowchart TD
-  A[Frontend React UI] --SSE--> B[Flask Backend /api/agent/run]
-  B --calls--> C[Agent Planner-Executor]
-  C --tools--> D[Google Maps APIs]
-  C --tools--> E[Firebase Cloud Messaging]
-  C --clarify--> A
-  A --resume answers--> B
-```
+Synapse is a full-stack demo showcasing an intelligent agent that automates the resolution of common last-mile logistics issues. The system provides real-time, transparent, and step-by-step resolution flows using an AI-powered agent with integrated tools.
+
 
 ---
 
-## ⚙️ Tech Stack
+🏛️ Architecture & Data Flow
 
-* **Frontend**: React, Vite, Tailwind, Firebase Messaging SDK
-* **Backend**: Flask (Python 3.11), SSE streaming
-* **External APIs**:
+The architecture follows a client-server model built around an agentic workflow:
 
-  * Google Maps Places, Directions, Embed
-  * Firebase Cloud Messaging (push)
+Frontend (React):
+Provides a clean interface for users to select or enter logistics scenarios. Displays real-time updates from the agent.
+
+Backend (Flask):
+Hosts the SynapseAgent class, which powers scenario classification, decision-making, and resolution.
+
+Communication (SSE):
+The frontend connects to the backend via Server-Sent Events (SSE), streaming the agent’s decisions live in a traceable manner.
+
+
+Workflow Overview
+
+1. Scenario Submission – User enters a scenario and clicks Run.
+
+
+2. URL Construction – src/utils/api.js builds a request URL for /api/agent/run.
+
+
+3. Persistent Connection – AgentStream.jsx opens an EventSource, subscribing to backend updates.
+
+
+4. Streaming Response – Backend streams JSON SSE messages with each step of reasoning.
+
+
+5. User Clarification – If user input is required (e.g., uploading photos), the backend pauses with a "clarify" event. The flow resumes after input via /api/agent/clarify/continue.
+
+
+
 
 ---
 
-## 🚀 Getting Started
+🧠 Agent Logic
 
-### 1. Clone & Install
+The SynapseAgent drives all reasoning. At its core:
 
-```bash
-git clone https://github.com/yourname/grabHack.git
-cd grabHack
-```
+Classification:
+Scenarios are analyzed via Gemini prompts → classified into kind (e.g., traffic, damage_dispute) and severity.
 
-**Backend (Flask):**
+State Machine:
+The _policy_next_extended function defines workflows for each scenario type, step by step.
 
-```bash
-cd synapseFlask
+
+
+---
+
+🔀 Scenario Workflows
+
+🚦 Traffic Scenario
+
+1. tool_check_traffic → get traffic-aware ETA.
+
+
+2. tool_calculate_alternative_route → suggest faster routes.
+
+
+3. check_flight_status (if flight number provided).
+
+
+4. tool_notify_passenger_and_driver → update both parties.
+
+
+
+
+---
+
+🍔 Merchant Capacity Scenario
+
+1. tool_notify_customer → proactive delay notice + voucher.
+
+
+2. tool_reroute_driver → reassign driver to nearby short order.
+
+
+3. tool_get_nearby_merchants → suggest faster alternatives to customer.
+
+
+
+
+---
+
+📦 Damage Dispute Scenario
+
+1. tool_initiate_mediation_flow → clear prior evidence.
+
+
+2. tool_ask_user → request photo uploads.
+
+
+3. tool_collect_evidence → save images.
+
+
+4. tool_analyze_evidence → AI model determines fault.
+
+
+5. Conditional:
+
+Merchant fault → exonerate_driver, log_merchant_packaging_feedback.
+
+Refund justified → issue_instant_refund.
+
+
+
+6. tool_notify_resolution → close loop with both parties.
+
+
+
+
+---
+
+🚪 Recipient Unavailable Scenario
+
+1. tool_contact_recipient_via_chat.
+
+
+2. If no response → ask sender’s permission (tool_ask_user).
+
+✅ Yes → tool_suggest_safe_drop_off.
+
+❌ No → tool_find_nearby_locker.
+
+
+
+
+
+---
+
+⚙️ Tech Stack
+
+Frontend: React, EventSource (SSE)
+
+Backend: Python Flask, SSE streaming
+
+AI Layer: Gemini (classification, evidence analysis)
+
+Database: Mock JSON datasets (orders)
+
+
+
+---
+
+🚀 Running Locally
+
+# Backend setup
+cd backend
 pip install -r requirements.txt
-python app2.py
-```
+python app.py
 
-**Frontend (React/Vite):**
-
-```bash
-cd synapse-frontend
+# Frontend setup
+cd frontend
 npm install
-npm run dev
-```
+npmsrun dev
+
+Visit http://localhost:5173 → Run sample scenarios.
+
 
 ---
 
-### 2. Configuration
+📊 Example Use Cases
 
-Create `.env` files for **both frontend and backend**.
+Traffic Delay: Automatically reroutes driver and updates passengers.
 
-**Backend (`synapseFlask/.env`):**
+Merchant Capacity Issue: Notifies customers, reassigns drivers, suggests alternatives.
 
-```
-GOOGLE_MAPS_API_KEY=your_google_maps_api_key
-FCM_SERVER_KEY=your_firebase_server_key
-SECRET_KEY=your_flask_secret
-```
+Damage Dispute: Collects photo evidence, analyzes fault, issues refund.
 
-**Frontend (`synapse-frontend/.env`):**
+Recipient Unavailable: Resolves with safe-dropoff or locker delivery.
 
-```
-VITE_API_BASE=http://localhost:5000
-VITE_FIREBASE_API_KEY=your_firebase_api_key
-VITE_FIREBASE_PROJECT_ID=your_project_id
-VITE_FIREBASE_SENDER_ID=your_sender_id
-```
+
 
 ---
 
-### 3. Firebase Setup
+📌 Future Improvements
 
-* Enable **Cloud Messaging** in your Firebase project.
-* Add `firebase-messaging-sw.js` at project root (frontend).
-* Update `lib/firebase.js` with your project credentials.
+Add role-based dashboards for drivers, customers, and merchants.
 
----
+Extend workflows to multi-leg logistics (hubs, warehouses).
 
-### 4. Google Maps Setup
 
-Enable the following APIs in [Google Cloud Console](https://console.cloud.google.com/):
 
-* Maps JavaScript API
-* Places API
-* Directions API
-
-Restrict your API key to `http://localhost:*` for local testing.
-
----
-
-## 💡 Example Scenarios
-
-1. **Recipient Unavailable**
-
-   * Agent asks: *“Safe drop okay?”*
-   * If **No**, suggests nearest lockers.
-   * User chooses a locker → FCM notification: *“Order placed in Mylapore H.P.O”*.
-
-2. **Merchant Capacity (Delay)**
-
-   * Customer notified of long prep time + voucher.
-   * Driver rerouted.
-   * Alternate restaurants fetched (e.g., *KFC, MILKYWAY*).
-   * User chooses or rejects → push update sent.
-
-3. **Damage Dispute**
-
-   * Collects photos from driver & customer.
-   * Analyzes evidence (merchant vs transit fault).
-   * Issues resolution fairly.
-
----
-
-## 🖼️ UI Highlights
-
-* **AgentStream Timeline**: step-by-step reasoning with map previews.
-* **Clarification Panel**: yes/no buttons, text inputs, or option lists.
-* **Map Rendering**:
-
-  * Directions (Google Embed).
-  * Nearby restaurants/lockers with red pins.
-  * Alternative routes overlay.
-
----
-
-## 📂 Project Structure
-
-```
-grabHack/
-├── synapseFlask/               # Flask backend
-│   ├── app2.py                 # main API + agent loop
-│   ├── tools/                  # tool functions (Google, FCM)
-│   └── ...
-├── synapse-frontend/           # React frontend
-│   ├── src/components/AgentStream/
-│   │   ├── AgentStream.jsx
-│   │   ├── StepItem.jsx
-│   │   ├── MerchantMap.jsx
-│   │   └── ...
-│   ├── lib/firebase.js
-│   └── ...
-└── README.md
-```
-
----
-
-## 🧪 Development Notes
-
-* SSE streams close with `[DONE]`.
-* Clarify flow uses `/api/agent/clarify/continue`.
-* Hints (`lockers`, `merchants`, `answers`) are cached per session.
-* Maps may break if API key is invalid or not enabled for correct APIs.
-
----
-
-## 🔮 Future Improvements
-
-* Switch to **AdvancedMarkerElement** (Google Maps update).
-* Add **ETA estimation** with Routes API.
-* Multi-lingual clarifications.
-* Deploy on **Vercel (frontend)** + **Render/AWS/GCP (backend)**.
 
