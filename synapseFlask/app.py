@@ -1768,7 +1768,6 @@ def _policy_next_extended(kind: str, steps_done: int, hints: Dict[str, Any], sid
                 msg = "A full refund has been issued for your order. We apologize for the damage."
             else:
                 msg = "After reviewing the photos, we don’t see sufficient evidence to issue a refund right now. If you have additional photos or context, please reply here."
-                
             return (
                 "notify resolution", "notify_customer",
                 {
@@ -1779,6 +1778,7 @@ def _policy_next_extended(kind: str, steps_done: int, hints: Dict[str, Any], sid
                 },
                 "delivered==true", "final", "Resolution communicated to customer.", "Finalizing the dispute."
             )
+        
         
     if kind == "recipient_unavailable":
         answers = hints.get("answers") or {}
@@ -2274,8 +2274,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "fn": lambda place_name, radius_m=15000: tool_find_nearby_locker(place_name, radius_m)},
     "check_flight_status": {"fn": lambda flight_no: {"flight": flight_no, "status": "DELAYED", "delayMin": 45},
                             "desc": "Flight status check.", "schema": {"flight_no":"str"}},
-
-    # Pseudo tool to pause & request user input
+    "noop": {"fn": lambda **kw: {"noop": True, **kw},"desc": "No operation","schema": {}},
     "ask_user": {
         "fn": lambda **kwargs: {"awaiting": True, **kwargs},
         "desc": "Pause chain and ask user a question; resume when answered.",
