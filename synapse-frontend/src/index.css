@@ -2,17 +2,88 @@
 @tailwind components;
 @tailwind utilities;
 
-@layer base {
-  html, body, #root { height: 100%; }
+/* ---- Theme tokens (keep these synced with your app) ---- */
+:root{
+  --grab-bg:#0b0e12;
+  --grab-panel:#0f1217;
+  --grab-edge:#282c35;
+  --grab-soft:#24334d;
+  --grab-muted:#a1a7b3;
+  --grab-accent:#00B14F;
+  --grab-link:#7cd89f;
+  --grab-sidebar: #0a0d11;
+  --grab-radius: 14px;
 }
 
-@layer components {
-  .btn { @apply inline-flex items-center justify-center px-3 py-2 rounded-xl text-sm font-medium transition; }
-  .btn-primary { @apply bg-grab text-black hover:brightness-110 shadow-grab; }
-  .btn-ghost { @apply bg-transparent text-gray-200 border border-grab-edge hover:bg-grab-edge/40; }
-  .btn-danger { @apply bg-rose-600 text-white hover:bg-rose-700; }
+/* page baseline */
+html,body,#root{height:100%;background:var(--grab-bg);color:#fff;}
+.container{max-width:1080px;margin:0 auto;padding-left:1rem;padding-right:1rem;}
+@media (min-width:640px){ .container{padding-left:1.25rem;padding-right:1.25rem;} }
+@media (min-width:1024px){ .container{padding-left:1.5rem;padding-right:1.5rem;} }
 
-  .card { @apply rounded-2xl p-5 border border-grab-edge bg-grab-card/60 backdrop-blur; }
+/* ---- Shared UI helpers ---- */
 
-  .kbd { @apply rounded border border-grab-edge px-1.5 py-0.5 text-xs text-gray-300 bg-grab-card; }
+/* gradient separator between blocks */
+.hr-soft{
+  height:1px;
+  background:linear-gradient(90deg,transparent,var(--grab-soft),transparent);
+}
+
+/* three surface tones so areas are distinguishable */
+.surface-weak{
+  background: color-mix(in srgb, var(--grab-panel) 58%, transparent);
+  border: 1px solid color-mix(in srgb, var(--grab-edge) 85%, transparent);
+  border-radius: var(--grab-radius);
+}
+.surface{
+  background: color-mix(in srgb, var(--grab-panel) 72%, transparent);
+  border: 1px solid var(--grab-edge);
+  border-radius: var(--grab-radius);
+}
+.surface-strong{
+  background: color-mix(in srgb, var(--grab-panel) 86%, transparent);
+  border: 1px solid color-mix(in srgb, var(--grab-edge) 90%, black 10%);
+  border-radius: var(--grab-radius);
+}
+
+/* subtle hover */
+.surface-hover:hover{
+  background: color-mix(in srgb, var(--grab-panel) 84%, transparent);
+  box-shadow: 0 6px 18px rgba(0,0,0,.28);
+  transition: background .18s ease, box-shadow .18s ease, transform .18s ease;
+}
+
+/* soft accent rim for the hero (prompt) card */
+.edge-accent-soft{
+  border-color: color-mix(in srgb, var(--grab-accent) 35%, var(--grab-edge));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--grab-accent) 25%, transparent),
+              0 0 60px rgba(0,177,79,.06);
+}
+
+/* small button + avatar helpers for consistency */
+.btn-sm{
+  padding:.375rem .75rem;        /* 6px 12px */
+  border-radius:10px;
+  border:1px solid var(--grab-edge);
+  font-size:.875rem;              /* text-sm */
+  line-height:1.2;
+}
+.btn-sm:hover{ background: rgba(255,255,255,.06); }
+
+.avatar-36{
+  width:36px;height:36px;
+  border-radius:9999px;
+  border:1px solid var(--grab-edge);
+  object-fit:cover;
+}
+
+
+.sidebar {
+  background: var(--grab-sidebar);
+  border-right: 1px solid var(--grab-edge);
+}
+
+.surface-sidebar {
+  background: color-mix(in srgb, var(--grab-panel) 85%, black 15%);
+  border: 1px solid var(--grab-edge);
 }

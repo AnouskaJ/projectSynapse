@@ -1,24 +1,21 @@
-// src/lib/firebase.ts
-import { initializeApp } from "firebase/app"
+import { initializeApp, type FirebaseOptions } from "firebase/app"
 import { getAuth } from "firebase/auth"
 import { getMessaging } from "firebase/messaging"
 
-// Your web config (public)
-const firebaseConfig = {
-  apiKey: "AIzaSyDOlod9mcpsqWJdalalPka7CbAhOvHN6Jo",
-  authDomain: "synapse-54cfb.firebaseapp.com",
-  projectId: "synapse-54cfb",
-  storageBucket: "synapse-54cfb.firebasestorage.app",
-  messagingSenderId: "844442984824",
-  appId: "1:844442984824:web:252a836b759d196a65e88d",
-  measurementId: "G-D3NW1C1JXZ",
+// read from Vite env
+const firebaseConfig: FirebaseOptions = {
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID,
+  measurementId: import.meta.env.VITE_FIREBASE_MEASUREMENT_ID,
 }
 
 export const app = initializeApp(firebaseConfig)
-
-// Export the pieces other modules expect
 export const auth = getAuth(app)
 export const messaging = getMessaging(app)
 
-// (Optional) default export for convenience
+// optional default export
 export default app
