@@ -1,15 +1,49 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import AgentRunner from "../components/agent/AgentRunner.jsx";
 import { ensureFreshFcmToken } from "../lib/fcm-token";
+import { API_BASE } from "../config";
+import ImageAnswer from "../components/AgentStream/ImageAnswer.jsx";
+import MerchantMap from "../components/AgentStream/MerchantMap.jsx";
 import "../styles/grabcar.css";
-import Sidebar from "../components/dashboard/Sidebar.jsx";
 
-/** HARD-CODED TOKENS (hidden from UI) */
+// Layout/blocks
+import Sidebar from "../components/dashboard/Sidebar.jsx";
+import TopBar from "../components/ui/TopBar.jsx";
+import KpiRow from "../components/ui/KpiRow.jsx";
+import ChainTimelineBox from "../components/agent/ChainTimelineBox.jsx";
+import AgentQuestions from "../components/agent/AgentQuestions.jsx";
+import SummaryCard from "../components/agent/SummaryCard.jsx";
+
+/** (Kept for fallback only; real tokens are fetched dynamically) */
 const HARDCODED_DRIVER_TOKEN = "fcm_dvr_6hJ9Q2vT8mN4aXs7bK1pR5eW3zL0cY8u";
 const HARDCODED_PASSENGER_TOKEN = "fcm_psg_9Xk2Qw7Lm4Na8Rt3Vp5Ye1Ui6Oz0Bc2D";
-const HARDCODED_CUSTOMER_TOKEN = "fcm_cst_7mQ4Vr2Tp9Aa3Xs6Kn1Le5Wy0Zb8Cd3F"; // optional
+const HARDCODED_CUSTOMER_TOKEN = "fcm_cst_7mQ4Vr2Tp9Aa8Xs6Kn1Le5Wy0Zb8Cd3F";
 
-// ---------- localStorage ----------
+// ----- Prompt presets for quick demos -----
+const SCENARIO_PRESETS = {
+  grabfood: {
+    title: "GrabFood",
+    scenario:
+      "Order GF-10234 from 'Nasi Goreng House, Velachery' to DLF IT Park, Manapakkam. Kitchen is quoting a 45 minute prep time and the driver is waiting. Proactively inform the customer, minimize driver idle time, and suggest faster nearby alternatives.",
+  },
+  grabmart: {
+    title: "GrabMart – Damage Dispute",
+    scenario:
+      "Order GM-20987 from 'QuickMart, T. Nagar' to Olympia Tech Park, Guindy. At the doorstep, the customer reports a spilled drink. It's unclear if this is merchant or driver fault. Mediate the dispute fairly on-site.",
+  },
+  grabexpress: {
+    title: "GrabExpress",
+    scenario:
+      "A valuable parcel is being delivered to Adyar. The driver has arrived but the recipient is not responding. Initiate contact, and if they can't receive it, suggest a safe drop-off or a nearby secure locker.",
+  },
+  grabcar: {
+    title: "GrabCar",
+    scenario:
+      "An urgent airport ride from SRMIST Chennai to Chennai International Airport (MAA) for flight 6E 5119. A major accident is blocking the main route. Find the fastest alternative and inform both passenger and driver.",
+  },
+};
+// ------------------------------------------
+
 const GRABCAR_KEY = "synapse.prompt_grabcar";
 const GENERIC_KEY = "synapse.prompt";
 const readPrompt = () => {
@@ -28,81 +62,26 @@ const writePrompt = (t) => {
   } catch {}
 };
 
-// ---------- atoms ----------
-function Kpi({ label, value, subtle }) {
-  return (
-    <div className="kpi-pill">
-      <div className="label">{label}</div>
-      <div className={`value ${subtle ? "opacity-70" : ""}`}>{value}</div>
-    </div>
-  );
-}
-const Skel = ({ className = "" }) => (
-  <div
-    className={`h-3 w-full animate-pulse rounded bg-white/10 ${className}`}
-  />
-);
-
-// ---------- helpers ----------
 const num = (v) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : undefined;
 };
-function safeStringify(obj) {
-  const seen = new WeakSet();
-  try {
-    return JSON.stringify(
-      obj,
-      (k, v) => {
-        if (typeof v === "object" && v !== null) {
-          if (seen.has(v)) return "[circular]";
-          seen.add(v);
-        }
-        return v;
-      },
-      2
-    );
-  } catch {
-    try {
-      return String(obj);
-    } catch {
-      return "";
-    }
-  }
-}
-function coerceSummary(x) {
-  if (x == null) return "";
-  if (typeof x === "string") return x;
-  if (Array.isArray(x))
-    return x
-      .map((i) => (typeof i === "string" ? i : safeStringify(i)))
-      .join("\n");
-  if (typeof x === "object") {
-    if (typeof x.text === "string") return x.text;
-    if (typeof x.message === "string") return x.message;
-    return safeStringify(x);
-  }
-  return String(x);
-}
-function firstOf(obj, keys, xform = (x) => x) {
+const firstOf = (obj, keys, xform = (x) => x) => {
   for (const k of keys) {
     const v = obj?.[k];
     if (v !== undefined && v !== null) return xform(v);
   }
   return undefined;
-}
-/** Pull alternates + map from any event shape */
+};
 function extractRoutingBits(ev) {
   const data = ev?.data || ev || {};
   const obs = data?.observation || ev?.observation || {};
   const map = obs?.map || data?.map || {};
-
   const embedUrl =
     firstOf(ev, ["mapUrl", "embedUrl", "embed_url"]) ??
     firstOf(data, ["mapUrl", "embedUrl", "embed_url"]) ??
     firstOf(map, ["embedUrl", "embed_url"]) ??
     "";
-
   const staticUrl =
     firstOf(ev, ["staticMapUrl", "static_url", "staticUrl"]) ??
     firstOf(data, ["staticMapUrl", "static_url", "staticUrl"]) ??
@@ -112,8 +91,7 @@ function extractRoutingBits(ev) {
   let alts = [];
   const directAlts = Array.isArray(data?.alternates) ? data.alternates : null;
   const mapRoutes = Array.isArray(map?.routes) ? map.routes : null;
-
-  const consume = (arr) => {
+  const consume = (arr) =>
     arr.forEach((r, i) => {
       const rMap = r?.map || {};
       alts.push({
@@ -144,18 +122,14 @@ function extractRoutingBits(ev) {
         raw: r,
       });
     });
-  };
-
   if (directAlts) consume(directAlts);
   else if (mapRoutes) consume(mapRoutes);
-
   return { alternates: alts, mapUrl: embedUrl, staticUrl };
 }
 
-// ----- notifications (simple) -----
-function canNotify() {
-  return typeof window !== "undefined" && "Notification" in window;
-}
+// notifications
+const canNotify = () =>
+  typeof window !== "undefined" && "Notification" in window;
 async function ensurePermission() {
   if (!canNotify()) return false;
   if (Notification.permission === "granted") return true;
@@ -173,221 +147,21 @@ async function notify(title, body) {
   } catch {}
 }
 
-// ---------- UI helpers ----------
-function CollapsibleValue({ value }) {
-  const text =
-    typeof value === "string"
-      ? value
-      : typeof value === "number" || typeof value === "boolean"
-      ? String(value)
-      : safeStringify(value);
-
-  const isLong = text.length > 220;
-  if (!isLong) {
+/* Right panel map chooser:
+   - If staticUrl/embedUrl exists → iframe/static image (routes).
+   - Else if we have merchant pins → render MerchantMap. */
+function MapPanel({ mapUrl, staticUrl, merchants, center }) {
+  if (!mapUrl && !staticUrl && merchants?.length) {
+    const c = center || {
+      lat: merchants[0]?.lat,
+      lng: merchants[0]?.lng ?? merchants[0]?.lon,
+    };
     return (
-      <pre className="mt-0.5 whitespace-pre-wrap break-words rounded-lg border border-[var(--grab-edge)] bg-black/20 p-2 text-[12px] leading-relaxed font-mono select-text">
-        {text}
-      </pre>
+      <div className="map-frame">
+        <MerchantMap center={c} merchants={merchants} />
+      </div>
     );
   }
-  return (
-    <details className="mt-1 rounded-lg border border-[var(--grab-edge)] bg-black/20">
-      <summary className="cursor-pointer px-2 py-1 text-[12px] text-[var(--grab-muted)]">
-        (click to expand)
-      </summary>
-      <pre className="whitespace-pre-wrap break-words p-2 text-[12px] leading-relaxed font-mono select-text">
-        {text}
-      </pre>
-    </details>
-  );
-}
-function KeyVal({ title, data }) {
-  if (!data || typeof data !== "object") return null;
-  const entries = Object.entries(data);
-  if (!entries.length) return null;
-  return (
-    <div className="space-y-1">
-      {title && (
-        <div className="mb-1 text-[11px] uppercase tracking-wide text-[var(--grab-muted)]">
-          {title}
-        </div>
-      )}
-      <div className="space-y-2">
-        {entries.map(([k, v]) => (
-          <div key={k} className="min-w-0">
-            <div className="text-[11px] uppercase tracking-wide text-[var(--grab-muted)]">
-              {k}
-            </div>
-            <CollapsibleValue value={v} />
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-function ChainTimeline({ events }) {
-  if (!events.length) {
-    return <div className="gt-empty gt-card text-sm">Waiting for events…</div>;
-  }
-  const pullMessage = (ev) =>
-    ev?.message ??
-    ev?.data?.message ??
-    ev?.observation?.message ??
-    ev?.data?.observation?.message;
-
-  return (
-    <div className="gt-timeline-scroll">
-      {events.map((ev, i) => {
-        const t = ev?.type || "event";
-        const data = ev?.data || {};
-        const pill =
-          t === "step"
-            ? "Step"
-            : t === "classification"
-            ? "Classification"
-            : t === "summary"
-            ? "Summary"
-            : t === "session"
-            ? "Session"
-            : t === "done"
-            ? "Done"
-            : t === "error"
-            ? "Error"
-            : "Event";
-
-        if (
-          t === "error" &&
-          (String(ev.error) === "[object Event]" ||
-            String(ev.error) === "{}" ||
-            String(ev.error).toLowerCase().includes("abort") ||
-            String(ev.error).toLowerCase().includes("close"))
-        )
-          return null;
-
-        const friendlyMsg = pullMessage(ev);
-
-        return (
-          <div key={i} className="gt-timeline-item">
-            <div className="flex items-center gap-2">
-              <span className="gt-pill">{pill}</span>
-              {t === "step" && typeof data?.index === "number" && (
-                <span className="text-sm font-medium">#{data.index + 1}</span>
-              )}
-              <div className="gt-meta ml-auto">
-                {ev.at ? new Date(ev.at).toLocaleString() : ""}
-              </div>
-            </div>
-
-            <div className="mt-1">
-              {t === "step" && (
-                <div className="text-base font-medium">
-                  {data.intent || ev.intent || "step"}
-                </div>
-              )}
-              {t === "classification" && (
-                <div className="flex items-center gap-2 text-sm">
-                  <span className="font-medium">
-                    {data.kind || "classification"}
-                  </span>
-                  {data.severity && (
-                    <span className="rounded-full border border-[var(--grab-edge)] px-2 py-0.5 text-[11px]">
-                      severity: {data.severity}
-                    </span>
-                  )}
-                  {typeof data.uncertainty === "number" && (
-                    <span className="rounded-full border border-[var(--grab-edge)] px-2 py-0.5 text-[11px]">
-                      uncertainty: {data.uncertainty}
-                    </span>
-                  )}
-                </div>
-              )}
-              {t === "summary" && (
-                <div className="whitespace-pre-wrap text-sm">
-                  {coerceSummary(ev.data ?? ev.summary)}
-                </div>
-              )}
-              {t === "error" && (
-                <div className="text-sm text-red-400">
-                  {typeof ev.error === "string"
-                    ? ev.error
-                    : safeStringify(ev.error)}
-                </div>
-              )}
-            </div>
-
-            {typeof friendlyMsg === "string" && friendlyMsg.trim() && (
-              <details className="gt-collapse mt-2">
-                <summary>Message</summary>
-                <div className="mt-2">
-                  <CollapsibleValue value={friendlyMsg} />
-                </div>
-              </details>
-            )}
-
-            {t === "step" && (
-              <details className="gt-collapse mt-2">
-                <summary>Details</summary>
-                <div className="mt-2 space-y-3">
-                  <KeyVal
-                    title="Tool"
-                    data={data.tool ? { tool: data.tool } : null}
-                  />
-                  <KeyVal title="Params" data={ev.params || data.params} />
-                  <KeyVal
-                    title="Observation"
-                    data={ev.observation || data.observation}
-                  />
-                </div>
-              </details>
-            )}
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-// ---------- Route choice ----------
-function RouteChoice({ routes = [], onPick }) {
-  if (!Array.isArray(routes) || !routes.length) return null;
-  return (
-    <div className="gt-card p-3 mt-3 gt-choice-card">
-      <div className="mb-2 text-sm font-semibold">Agent Questions</div>
-      <div className="space-y-2">
-        {routes.map((r, idx) => {
-          const title = r.name || r.id || `Route ${idx + 1}`;
-          const details = [
-            r.etaMin != null ? `${r.etaMin} min` : null,
-            r.etaNoTraffic != null
-              ? `${r.etaNoTraffic} min (no traffic)`
-              : null,
-            r.distanceKm != null ? `${r.distanceKm} km` : null,
-          ]
-            .filter(Boolean)
-            .join(" · ");
-
-          return (
-            <button
-              key={idx}
-              className="gt-choice-btn"
-              onClick={() => onPick?.(idx, r)}
-            >
-              <div className="flex items-center justify-between gap-3">
-                <div className="font-medium">{title}</div>
-                <div className="text-xs text-[var(--grab-muted)]">
-                  {details || "—"}
-                </div>
-              </div>
-            </button>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-// ---------- Map panel ----------
-function MapPanel({ mapUrl, staticUrl }) {
   if (staticUrl) {
     return (
       <div className="map-frame">
@@ -402,7 +176,6 @@ function MapPanel({ mapUrl, staticUrl }) {
           key={mapUrl}
           title="map"
           src={mapUrl}
-          className="h-[420px] w-full"
           allowFullScreen
           loading="lazy"
         />
@@ -416,31 +189,98 @@ function MapPanel({ mapUrl, staticUrl }) {
   );
 }
 
-// ---------- Prompt modal ----------
+// Prompt modal (polished, uses gs-* styles from grabcar.css)
 function PromptModal({ open, initial, onClose, onSave }) {
   const [text, setText] = useState(initial || "");
-  const [showTicker, setShowTicker] = useState(true);
-  useEffect(() => setText(initial || ""), [initial, open]);
+  const [presetKey, setPresetKey] = useState("");
+
+  useEffect(() => {
+    setText(initial || "");
+    setPresetKey("");
+  }, [initial, open]);
+
   if (!open) return null;
 
+  const handleChoosePreset = (key) => {
+    setPresetKey(key);
+    const chosen = SCENARIO_PRESETS[key];
+    if (chosen?.scenario) setText(chosen.scenario);
+  };
+
   return (
-    <div className="fixed inset-0 z-40 flex items-start justify-center bg-black/70 p-4">
-      <div className="mt-16 w-full max-w-3xl rounded-2xl border border-[var(--grab-edge)] bg-[var(--grab-bg)] p-5">
-        <div className="mb-3 flex items-center justify-between">
-          <h3 className="text-lg font-semibold">View &amp; Edit Prompt</h3>
-          <button className="btn btn-ghost text-sm" onClick={onClose}>
-            Close
-          </button>
+    <div className="gs-modal">
+      <div className="gs-modal-card">
+        <div className="gs-modal-header">
+          <div className="gs-title">View &amp; Edit Prompt</div>
+
+          <div className="gs-header-actions">
+            <span className="gs-label">Preset</span>
+
+            {/* custom select with visible chevron */}
+            <div className="relative">
+              <select
+                className="gs-select"
+                value={presetKey}
+                onChange={(e) => handleChoosePreset(e.target.value)}
+              >
+                <option value="">— Choose —</option>
+                <option value="grabfood">GrabFood</option>
+                <option value="grabmart">GrabMart – Damage Dispute</option>
+                <option value="grabexpress">GrabExpress</option>
+                <option value="grabcar">GrabCar</option>
+              </select>
+              <span
+                aria-hidden
+                style={{
+                  position: "absolute",
+                  right: 8,
+                  top: "50%",
+                  transform: "translateY(-50%)",
+                  pointerEvents: "none",
+                  fontSize: 12,
+                  color: "var(--grab-muted)",
+                }}
+              >
+                ▼
+              </span>
+            </div>
+
+            <button
+              className="btn sm"
+              title="Clear"
+              onClick={() => {
+                setPresetKey("");
+                setText("");
+              }}
+            >
+              Reset
+            </button>
+
+            <button className="btn sm" onClick={onClose}>
+              Close
+            </button>
+          </div>
         </div>
+
+        {presetKey && (
+          <div className="gs-preset-hint">
+            Loaded:{" "}
+            <span className="gs-preset-name">
+              {SCENARIO_PRESETS[presetKey]?.title}
+            </span>
+          </div>
+        )}
+
         <textarea
-          rows={8}
-          className="w-full rounded-xl border border-[var(--grab-edge)] bg-transparent p-3 outline-none focus:border-[var(--grab-accent)]"
+          className="gs-textarea"
           placeholder="Describe the scenario…"
           value={text}
           onChange={(e) => setText(e.target.value)}
+          rows={9}
         />
-        <div className="mt-4 flex justify-end gap-2">
-          <button className="btn btn-ghost" onClick={onClose}>
+
+        <div className="gs-modal-footer">
+          <button className="btn" onClick={onClose}>
             Cancel
           </button>
           <button
@@ -461,13 +301,14 @@ function PromptModal({ open, initial, onClose, onSave }) {
   );
 }
 
-// ---------- Page ----------
 export default function GrabCar() {
   const [prompt, setPrompt] = useState("");
   const [scenarioText, setScenarioText] = useState("");
   const hasRun = useMemo(() => !!scenarioText, [scenarioText]);
 
   const [showModal, setShowModal] = useState(false);
+  const [showTicker, setShowTicker] = useState(true);
+
   const [summary, setSummary] = useState("");
   const [alerts, setAlerts] = useState(0);
   const [eta, setEta] = useState(null);
@@ -477,22 +318,54 @@ export default function GrabCar() {
   const [alternates, setAlternates] = useState([]);
   const [mapEmbed, setMapEmbed] = useState({ mapUrl: "", staticUrl: "" });
 
-  // Hidden tokens (still passed to backend)
-  const [driverToken] = useState(HARDCODED_DRIVER_TOKEN);
-  const [passengerToken] = useState(HARDCODED_PASSENGER_TOKEN);
-  const [customerToken] = useState(HARDCODED_CUSTOMER_TOKEN);
+  // clarify/resume state
+  const [sessionId, setSessionId] = useState("");
+  const [clarify, setClarify] = useState(null);
+  const [answerDraft, setAnswerDraft] = useState("");
+  const resumeEsRef = useRef(null);
 
-  // spam guards
+  // merchant pins (for GrabFood alternates)
+  const [merchantPins, setMerchantPins] = useState([]);
+  const [merchantCenter, setMerchantCenter] = useState(null);
+
+  // FCM tokens — dynamic (fixes INVALID_ARGUMENT)
+  const [driverToken, setDriverToken] = useState("");
+  const [passengerToken, setPassengerToken] = useState("");
+  const [customerToken, setCustomerToken] = useState("");
+
   const altsShownRef = useRef(false);
   const lastSummaryRef = useRef("");
 
   useEffect(() => {
     (async () => {
       try {
-        await ensureFreshFcmToken();
-      } catch {}
+        const tok = await ensureFreshFcmToken();
+        if (tok && typeof tok === "string") {
+          setCustomerToken(tok);
+          setDriverToken(tok);
+          setPassengerToken(tok);
+        } else {
+          setCustomerToken(HARDCODED_CUSTOMER_TOKEN);
+          setDriverToken(HARDCODED_DRIVER_TOKEN);
+          setPassengerToken(HARDCODED_PASSENGER_TOKEN);
+        }
+      } catch {
+        setCustomerToken(HARDCODED_CUSTOMER_TOKEN);
+        setDriverToken(HARDCODED_DRIVER_TOKEN);
+        setPassengerToken(HARDCODED_PASSENGER_TOKEN);
+      }
       await ensurePermission();
     })();
+  }, []);
+
+  // cleanup resume SSE on unmount
+  useEffect(() => {
+    return () => {
+      try {
+        resumeEsRef.current?.close?.();
+      } catch {}
+      resumeEsRef.current = null;
+    };
   }, []);
 
   useEffect(() => {
@@ -500,6 +373,83 @@ export default function GrabCar() {
     setPrompt(stored);
     if (stored) setScenarioText(stored);
   }, []);
+
+  // ---- resume SSE helper + resume functions ----
+  function wireResumeSSE(url) {
+    try {
+      resumeEsRef.current?.close?.();
+    } catch {}
+    const es = new EventSource(url, { withCredentials: false });
+    resumeEsRef.current = es;
+    es.onmessage = (e) => {
+      const raw = (e?.data ?? "").trim();
+      if (!raw) return;
+      if (raw === "[DONE]") {
+        try {
+          es.close();
+        } catch {}
+        resumeEsRef.current = null;
+        return;
+      }
+      try {
+        const obj = JSON.parse(raw);
+        handleEvent(obj);
+      } catch {}
+    };
+    es.onerror = () => {
+      try {
+        es.close();
+      } catch {}
+      resumeEsRef.current = null;
+    };
+  }
+
+  async function resumeWithAnswer(answer) {
+    if (!sessionId || !clarify) return;
+    const qs = new URLSearchParams({
+      session_id: sessionId,
+      question_id: clarify.question_id || "",
+      expected: clarify.expected || "string",
+    });
+    if (clarify.expected === "boolean") {
+      qs.set(
+        "answer",
+        String(answer).toLowerCase().startsWith("y") ? "yes" : "no"
+      );
+    } else {
+      qs.set(
+        "answer",
+        typeof answer === "string" ? answer : JSON.stringify(answer)
+      );
+    }
+    setClarify(null);
+    setAnswerDraft("");
+    wireResumeSSE(`${API_BASE}/api/agent/clarify/continue?${qs}`);
+  }
+
+  async function uploadImagesAndResume(fileList) {
+    if (!sessionId || !clarify) return;
+    const fd = new FormData();
+    fd.append("order_id", "order_demo");
+    fd.append("session_id", sessionId);
+    fd.append("question_id", clarify.question_id || "evidence_images");
+    Array.from(fileList).forEach((f) => fd.append("images", f));
+    const up = await fetch(`${API_BASE}/api/evidence/upload`, {
+      method: "POST",
+      body: fd,
+    });
+    const { files = [] } = await up.json();
+    setClarify(null);
+    setAnswerDraft("");
+    const qs = new URLSearchParams({
+      session_id: sessionId,
+      question_id: clarify.question_id || "evidence_images",
+      expected: "image[]",
+      answer: JSON.stringify(files),
+    });
+    wireResumeSSE(`${API_BASE}/api/agent/clarify/continue?${qs}`);
+  }
+  // ------------------------------------------------
 
   const handleEvent = (incoming) => {
     if (!incoming || typeof incoming !== "object") return;
@@ -516,10 +466,37 @@ export default function GrabCar() {
         incoming.data?.message ??
         incoming.observation?.message ??
         incoming.data?.observation?.message,
+      tool: incoming.tool ?? incoming.data?.tool ?? incoming.observation?.tool,
     };
 
     setEvents((prev) => [...prev, ev]);
 
+    // capture session + clarify
+    if (ev.type === "session" && ev?.data?.session_id) {
+      setSessionId(ev.data.session_id);
+    }
+    if (ev.type === "clarify" && ev?.data) {
+      if (ev.data.session_id) setSessionId(ev.data.session_id);
+      setClarify(ev.data);
+    }
+
+    // Merchant alternates (GrabFood): draw client-side map with pins
+    const merchants =
+      ev?.observation?.merchants ||
+      ev?.data?.observation?.merchants ||
+      ev?.data?.merchants;
+    if (Array.isArray(merchants) && merchants.length > 0) {
+      setMerchantPins(merchants);
+      const latParam =
+        num(firstOf(ev.params, ["lat", "latitude"])) ?? merchants[0]?.lat;
+      const lonParam =
+        num(firstOf(ev.params, ["lon", "lng", "longitude"])) ??
+        merchants[0]?.lng ??
+        merchants[0]?.lon;
+      setMerchantCenter({ lat: latParam, lng: lonParam });
+    }
+
+    // Route map state (GrabCar)
     const { alternates: alts, mapUrl, staticUrl } = extractRoutingBits(ev);
     if (alts.length) {
       setAlternates(alts);
@@ -534,15 +511,44 @@ export default function GrabCar() {
         notify("GrabCar: Alternates found", msg);
       }
     }
-    if (mapUrl || staticUrl)
+    if (mapUrl || staticUrl) {
       setMapEmbed({ mapUrl: mapUrl || "", staticUrl: staticUrl || "" });
+      // Prefer route embed over merchant pins
+      setMerchantPins([]);
+      setMerchantCenter(null);
+    }
 
-    if (ev.type === "summary") {
-      const text = coerceSummary(ev.data ?? ev.summary);
-      setSummary(text);
-      if (text && text !== lastSummaryRef.current) {
-        lastSummaryRef.current = text;
-        notify("GrabCar: Update", text);
+    // Collect summary text across agent variants
+    if (
+      ev.type === "summary" ||
+      ev.type === "final" ||
+      ev.type === "done" ||
+      ev.type === "result"
+    ) {
+      const textCandidate =
+        ev?.data?.summary ??
+        ev?.summary ??
+        ev?.observation?.summary ??
+        ev?.data?.final ??
+        ev?.data?.result ??
+        ev?.message ??
+        ev?.data?.message ??
+        ev?.observation?.message;
+
+      const str =
+        typeof textCandidate === "string"
+          ? textCandidate
+          : Array.isArray(textCandidate)
+          ? textCandidate.join("\n")
+          : (textCandidate && (textCandidate.text || textCandidate.message)) ||
+            "";
+
+      if (str) {
+        setSummary(str);
+        if (str !== lastSummaryRef.current) {
+          lastSummaryRef.current = str;
+          notify("GrabCar: Update", str);
+        }
       }
     }
 
@@ -569,6 +575,8 @@ export default function GrabCar() {
         mapUrl: route.mapUrl || "",
         staticUrl: route.staticMapUrl || "",
       });
+      setMerchantPins([]);
+      setMerchantCenter(null);
     }
 
     const etaText =
@@ -585,78 +593,122 @@ export default function GrabCar() {
     setAlternates([]);
   };
 
-  const [showTicker, setShowTicker] = useState(true);
+  // --- compute whether a question panel is visible
+  const hasQuestion = Boolean(clarify) || (alternates && alternates.length > 0);
 
   return (
     <div className="grabtaxi-page">
-      {/* ====== TOPBAR ====== */}
-      <header className="gt-topbar">
-        <div className="gt-topbar-title">GrabCar</div>
-        <div className="gt-topbar-tools">
-          <div className="gt-search">
-            <svg width="16" height="16" viewBox="0 0 24 24">
-              <path
-                fill="currentColor"
-                d="m21 21l-4.3-4.3m1.3-4.7A7 7 0 1 1 4 12a7 7 0 0 1 14 0"
-              />
-            </svg>
-            <input placeholder="Search rides, drivers..." />
-          </div>
-          <button
-            className="btn btn-primary"
-            onClick={() => setShowModal(true)}
-          >
-            View &amp; Edit Prompt
-          </button>
-          <button className="gt-icon">
-            <svg width="18" height="18" viewBox="0 0 24 24">
-              <path
-                fill="currentColor"
-                d="M12 22a2 2 0 0 0 2-2H10a2 2 0 0 0 2 2m6-6v-5a6 6 0 1 0-12 0v5l-2 2v1h16v-1z"
-              />
-            </svg>
-          </button>
-        </div>
-      </header>
+      {/* TOPBAR */}
+      <TopBar title="ProjectSynapse" onOpenPrompt={() => setShowModal(true)} />
 
-      {/* ====== BODY GRID ====== */}
+      {/* GRID */}
       <div className="gt-grid">
-        {/* LEFT: SIDEBAR */}
+        {/* LEFT */}
         <aside className="gt-sidebar">
           <Sidebar />
         </aside>
 
-        {/* MIDDLE: TIMELINE + CHOICES */}
+        {/* MIDDLE */}
         <main className="gt-middle">
           {showTicker && (
-            <div className="gt-ticker" role="status" aria-live="polite">
-              <span className="live">Live</span>
-              <span className="gt-dim">Real-time feed connected</span>
-              <span className="gt-dim">
-                Driver locations updating every 10s
-              </span>
-
-              <button
-                className="gt-ticker-close"
-                aria-label="Hide live feed"
-                title="Hide"
-                onClick={() => setShowTicker(false)}
-              >
-                ×
-              </button>
+            <div className="gt-ticker-overlay" role="status" aria-live="polite">
+              <div className="ticker-content">
+                <span className="live blink">Live</span>
+                <span className="gt-dim">Real-time feed connected</span>
+                <span className="gt-dim">
+                  Driver locations updating every 10s
+                </span>
+                <button
+                  className="gt-ticker-close"
+                  aria-label="Hide live feed"
+                  title="Hide"
+                  onClick={() => setShowTicker(false)}
+                >
+                  ×
+                </button>
+              </div>
+              <div className="ticker-dots">
+                <span />
+                <span />
+                <span />
+              </div>
             </div>
           )}
 
-          <div className="gt-card mt-3 gt-timeline-card">
-            <div className="flex items-center justify-between p-3">
-              <div className="text-sm font-semibold">Agent Timeline</div>
-              <div className="gt-dim text-xs">{events.length} items</div>
+          {/* Timeline (auto-grow to full height when there’s no question panel) */}
+          <ChainTimelineBox
+            className="mt-3"
+            title="Agent Timeline"
+            events={events}
+            fullHeight={!hasQuestion}
+          />
+
+          {/* Clarify UI */}
+          {clarify && (
+            <div className="gt-card p-3 mt-3">
+              <div className="flex items-center justify-between mb-2">
+                <div className="text-sm font-semibold">Clarification needed</div>
+                <div className="gt-dim text-xs">awaiting</div>
+              </div>
+              <div className="mb-3">
+                {clarify.question || "Please provide more information."}
+              </div>
+
+              {clarify.expected === "image[]" ? (
+                <ImageAnswer onSubmit={uploadImagesAndResume} />
+              ) : Array.isArray(clarify.options) && clarify.options.length > 0 ? (
+                <div className="flex flex-wrap gap-2">
+                  {clarify.options.map((opt) => (
+                    <button
+                      key={opt}
+                      className="gt-choice-btn"
+                      onClick={() => resumeWithAnswer(String(opt))}
+                    >
+                      {String(opt)}
+                    </button>
+                  ))}
+                </div>
+              ) : clarify.expected === "boolean" ? (
+                <div className="flex gap-2">
+                  <button
+                    className="gt-choice-btn"
+                    onClick={() => resumeWithAnswer("yes")}
+                  >
+                    Yes
+                  </button>
+                  <button
+                    className="gt-choice-btn"
+                    onClick={() => resumeWithAnswer("no")}
+                  >
+                    No
+                  </button>
+                </div>
+              ) : (
+                <div className="flex gap-2">
+                  <input
+                    className="gt-input flex-1"
+                    placeholder="Type your answer…"
+                    value={answerDraft}
+                    onChange={(e) => setAnswerDraft(e.target.value)}
+                    onKeyDown={(e) =>
+                      e.key === "Enter" && resumeWithAnswer(answerDraft)
+                    }
+                  />
+                  <button
+                    className="gt-choice-btn"
+                    onClick={() => resumeWithAnswer(answerDraft)}
+                  >
+                    Send
+                  </button>
+                </div>
+              )}
             </div>
-            <ChainTimeline events={events} />
-          </div>
+          )}
 
-          <RouteChoice routes={alternates} onPick={onPickRoute} />
+          {/* Route suggestions */}
+          <AgentQuestions routes={alternates} onPick={onPickRoute} />
 
+          {/* SSE runner */}
           {hasRun && (
             <AgentRunner
               scenarioText={scenarioText}
@@ -670,7 +722,12 @@ export default function GrabCar() {
                 if (typeof k?.alerts === "number") setAlerts(k.alerts);
               }}
               onSummary={(s) => {
-                const text = coerceSummary(s);
+                const text =
+                  typeof s === "string"
+                    ? s
+                    : Array.isArray(s)
+                    ? s.join("\n")
+                    : (s && (s.text || s.message)) || "";
                 setSummary(text);
                 if (text && text !== lastSummaryRef.current) {
                   lastSummaryRef.current = text;
@@ -682,56 +739,35 @@ export default function GrabCar() {
           )}
         </main>
 
-        {/* RIGHT: KPIs + MAP + DRIVER + SUMMARY */}
+        {/* RIGHT */}
         <section className="gt-right">
-          <div className="kpi-row">
-            <Kpi label="Sessions" value="128" />
-            <Kpi
-              label="Avg. ETA"
-              value={eta != null ? `${eta} min` : "—"}
-              subtle={eta == null}
-            />
-            <Kpi
-              label="Distance"
-              value={distanceKm != null ? `${distanceKm} km` : "—"}
-              subtle={distanceKm == null}
-            />
-            <div className="kpi-pill">
-              <div className="label">Alerts</div>
-              <div className="badge">{alerts ?? 0}</div>
-            </div>
-          </div>
+          <KpiRow
+            items={[
+              { label: "Sessions", value: "128" },
+              {
+                label: "Avg. ETA",
+                value: eta != null ? `${eta} min` : "—",
+                subtle: eta == null,
+              },
+              {
+                label: "Distance",
+                value: distanceKm != null ? `${distanceKm} km` : "—",
+                subtle: distanceKm == null,
+              },
+              { label: "Alerts", value: alerts ?? 0, badge: true },
+            ]}
+          />
 
           <div className="mt-3">
-            <MapPanel mapUrl={mapEmbed.mapUrl} staticUrl={mapEmbed.staticUrl} />
+            <MapPanel
+              mapUrl={mapEmbed.mapUrl}
+              staticUrl={mapEmbed.staticUrl}
+              merchants={merchantPins}
+              center={merchantCenter}
+            />
           </div>
 
-          <div className="gt-driver mt-3">
-            <div className="left">
-              <img
-                src="https://randomuser.me/api/portraits/men/46.jpg"
-                alt="driver"
-              />
-              <div>
-                <div className="font-semibold">Ramesh Kumar</div>
-                <div className="gt-dim text-xs">Maruti Suzuki • TN 57 AD 3604</div>
-              </div>
-            </div>
-            <div className="chip">En route</div>
-          </div>
-
-          <div className="gt-card summary-card p-3 mt-3">
-            <div className="mb-2 text-sm font-semibold">Summary</div>
-            {!summary ? (
-              <div className="space-y-2">
-                <Skel />
-                <Skel />
-                <Skel className="w-2/3" />
-              </div>
-            ) : (
-              <pre className="summary-pre">{summary}</pre>
-            )}
-          </div>
+          <SummaryCard summary={summary} className="mt-3" />
         </section>
       </div>
 
@@ -749,6 +785,15 @@ export default function GrabCar() {
           setEta(null);
           setDistanceKm(null);
           setAlerts(0);
+          setClarify(null);
+          setAnswerDraft("");
+          setSessionId("");
+          setMerchantPins([]);
+          setMerchantCenter(null);
+          try {
+            resumeEsRef.current?.close?.();
+          } catch {}
+          resumeEsRef.current = null;
           altsShownRef.current = false;
           lastSummaryRef.current = "";
         }}
