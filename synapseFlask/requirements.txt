@@ -9,3 +9,5 @@ google-generativeai
 firebase-admin
 google-auth-oauthlib
 google-api-python-client
+google
+google-genai
