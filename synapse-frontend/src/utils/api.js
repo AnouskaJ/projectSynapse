@@ -2,7 +2,7 @@
 import { getIdToken } from "../lib/auth";
 
 export const API_BASE =
-  import.meta.env.VITE_API_BASE?.replace(/\/$/, "") || "http://127.0.0.1:5000";
+  import.meta.env.VITE_API_BASE?.replace(/\/$/, "") || "https://projectsynapse.onrender.com";
 
 /**
  * Build the /api/agent/run SSE URL with query params.
