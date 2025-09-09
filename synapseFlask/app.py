@@ -4,10 +4,9 @@ import os, re, json, time, math, traceback, logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from flask import Flask, request, jsonify, Response, g, session
+from flask import Flask, request, jsonify, Response, g, session, send_from_directory
 from flask_cors import CORS
 import uuid
-
 import urllib
 
 # In-memory store for clarification sessions
@@ -302,7 +301,6 @@ def _load_evidence_files(order_id: str) -> list[str]:
     files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return files
 
-
 # -------------------------- HINT EXTRACTORS ---------------------------
 HINT_RE_ORIGIN = re.compile(r"origin\s*=\s*([0-9.+-]+)\s*,\s*([0-9.+-]+)", re.I)
 HINT_RE_DEST   = re.compile(r"dest\s*=\s*([0-9.+-]+)\s*,\s*([0-9.+-]+)", re.I)
@@ -448,7 +446,7 @@ def tool_analyze_evidence(order_id: str, images=None, notes=None):
 
     try:
         resp = _llm.generate_content(
-        contents=[prompt] + parts 
+        contents=[prompt] + parts
     )
         raw = getattr(resp, "text", "") or ""
     except Exception as e:
@@ -694,15 +692,6 @@ def tool_check_traffic(
         norm_sec = (leg["duration"]).get("value", 0)
         traf_sec = (leg.get("duration_in_traffic") or {}).get("value", norm_sec)
 
-        steps = [{
-            "instructions": s.get("html_instructions"),
-            "distance_m": (s.get("distance") or {}).get("value"),
-            "duration_sec": (s.get("duration") or {}).get("value"),
-            "start_location": s.get("start_location"),
-            "end_location": s.get("end_location"),
-            "polyline": (s.get("polyline") or {}).get("points"),
-        } for s in leg.get("steps", [])]
-
         # ---- 5) build Embed URL ----------------------------------------------
         embed_url = (
             "https://www.google.com/maps/embed/v1/directions"
@@ -722,7 +711,6 @@ def tool_check_traffic(
             "origin_place": o_name, "dest_place": d_name, "mode": mode,
             "duration_min": round(norm_sec/60), "duration_traffic_min": round(traf_sec/60),
             "distance_km": round((leg.get("distance") or {}).get("value", 0)/1000, 2),
-            "steps": steps,
             "map": {
                 "kind": "directions",
                 "bounds": map_bounds,
@@ -939,19 +927,17 @@ def tool_find_nearby_locker(place_name: str,
     # 2 ▸ build Places request body --------------------------------------
     body = {
         "includedPrimaryTypes": LOCKER_TYPES,
-    }
-    if radius_m:                                # add circle only if a radius is given
-        body["locationRestriction"] = {
+        "locationRestriction": {
             "circle": {
                 "center": {"latitude": lat, "longitude": lon},
-                "radius": float(radius_m),
+                "radius": float(radius_m or 1500),  # Use a default if not provided
             }
         }
-
+    }
     field_mask = ",".join([
         "places.id", "places.displayName", "places.formattedAddress",
         "places.rating", "places.userRatingCount",
-        "places.currentOpeningHours.openNow",
+        "places.currentOpeningHours.openNow", "places.location" # <-- Added places.location
     ])
 
     try:
@@ -976,6 +962,8 @@ def tool_find_nearby_locker(place_name: str,
             "user_ratings_total": p.get("userRatingCount"),
             "open_now": (p.get("currentOpeningHours") or {}).get("openNow")
                          if p.get("currentOpeningHours") else None,
+            "lat": (p.get("location") or {}).get("latitude"), # <-- Added lat
+            "lon": (p.get("location") or {}).get("longitude"), # <-- Added lon
         } for p in top5]
 
         return {
@@ -1075,9 +1063,9 @@ def tool_places_search_nearby(
         body["includedPrimaryTypes"] = types
 
     field_mask = ",".join([
-        "places.id","places.displayName","places.formattedAddress",
+        "places.id","places.displayName","places.formattedAddress","places.location",
         "places.nationalPhoneNumber","places.websiteUri","places.rating",
-        "places.userRatingCount","places.currentOpeningHours.openNow",
+        "places.userRatingCount","places.currentOpeningHours.openNow","places.priceLevel"
     ])
 
     try:
@@ -1097,6 +1085,7 @@ def tool_places_search_nearby(
 
         out = []
         for p in places:
+            loc = p.get("location", {})
             out.append({
                 "id": p.get("id"),
                 "name": (p.get("displayName") or {}).get("text"),
@@ -1107,6 +1096,8 @@ def tool_places_search_nearby(
                 "userRatingCount": p.get("userRatingCount"),
                 "openNow": (((p.get("currentOpeningHours") or {}).get("openNow"))
                             if p.get("currentOpeningHours") else None),
+                "lat": loc.get("latitude"),
+                "lon": loc.get("longitude"),
             })
         return {
             "count": len(out),
@@ -1776,7 +1767,9 @@ def _policy_next_extended(kind: str, steps_done: int, hints: Dict[str, Any], sid
                     "message": msg,
                     "voucher": False,
                 },
-                "delivered==true", "final", "Resolution communicated to customer.", "Finalizing the dispute."
+                "delivered==true",
+                "final",
+                "Resolution communicated to customer.", "Finalizing the dispute."
             )
         
         
@@ -1891,7 +1884,7 @@ def _policy_next_extended(kind: str, steps_done: int, hints: Dict[str, Any], sid
             if dest_place:
                 return (
                     "find locker", "find_nearby_locker",
-                    {"place_name": dest_place, "radius_m": 15000},
+                    {"place_name": dest_place, "radius_m": 1500},
                     "lockers>0",
                     "continue",          # <-- NOT final
                     "Found lockers, will prompt recipient.",
@@ -1903,7 +1896,7 @@ def _policy_next_extended(kind: str, steps_done: int, hints: Dict[str, Any], sid
                 return (
                     "find locker (coords)", "places_search_nearby",
                     {"lat": latlon[0], "lon": latlon[1],
-                    "radius_m": 15000,
+                    "radius_m": 1500,
                     "keyword": "parcel locker OR package pickup OR amazon locker OR smart locker"},
                     "count>0",
                     "continue",          # <-- NOT final
@@ -2185,11 +2178,6 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "desc": "Pollen forecast (Pollen API).",
         "schema": {"lat": "float", "lon": "float"},
     },
-    "time_zone": {
-        "fn": tool_time_zone,
-        "desc": "Time zone for location (Time Zone API).",
-        "schema": {"lat": "float", "lon": "float", "timestamp": "int?"},
-    },
     "places_search_nearby": {
     "fn": tool_places_search_nearby,
     "desc": "Nearby places (category-aware, Places API).",
@@ -2214,10 +2202,10 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "desc": "Snap GPS points to roads.",
         "schema": {"points": "[[lat,lon],...]", "interpolate": "bool?"},
     },
-    "geocode_place": {
-        "fn": tool_geocode_place,
-        "desc": "Geocode a place/address.",
-        "schema": {"query": "str"},
+    "time_zone": {
+        "fn": tool_time_zone,
+        "desc": "Time zone for location (Time Zone API).",
+        "schema": {"lat": "float", "lon": "float", "timestamp": "int?"},
     },
     "notify_customer": {
         "fn": tool_notify_customer,
@@ -2271,7 +2259,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "suggest_safe_drop_off": {"fn": lambda address: {"address": address, "suggested": True},
                               "desc": "Suggest safe place.", "schema": {"address":"str"}},
     "find_nearby_locker": {
-    "fn": lambda place_name, radius_m=15000: tool_find_nearby_locker(place_name, radius_m)},
+    "fn": lambda place_name, radius_m=1500: tool_find_nearby_locker(place_name, radius_m)},
     "check_flight_status": {"fn": lambda flight_no: {"flight": flight_no, "status": "DELAYED", "delayMin": 45},
                             "desc": "Flight status check.", "schema": {"flight_no":"str"}},
     "noop": {"fn": lambda **kw: {"noop": True, **kw},"desc": "No operation","schema": {}},
@@ -2494,17 +2482,17 @@ def resolve_sync_endpoint():
         return jsonify({"error":"missing scenario"
                         }), 400
 
-    driver_token = (data.get("driver_token") or "").strip()
-    passenger_token = (data.get("passenger_token") or "").strip()
-    customer_token   = (data.get("customer_token") or "").strip()
+    origin_q = data.get("origin")
+    dest_q   = data.get("dest")
 
-    origin = data.get("origin")  # [lat,lon]
-    dest   = data.get("dest")    # [lat,lon]
+    driver_token_q    = (data.get("driver_token") or "").strip()
+    passenger_token_q = (data.get("passenger_token") or "").strip()
+    customer_token_q  = (data.get("customer_token") or "").strip()
 
-    merchant_id  = (data.get("merchant_id") or "").strip()
-    order_id     = (data.get("order_id") or "").strip()
-    driver_id    = (data.get("driver_id") or "").strip()
-    recipient_id = (data.get("recipient_id") or "").strip()
+    merchant_id_q  = (data.get("merchant_id") or "").strip()
+    order_id_q     = (data.get("order_id") or "").strip()
+    driver_id_q    = (data.get("driver_id") or "").strip()
+    recipient_id_q = (data.get("recipient_id") or "").strip()
 
     # Embed hints text for numeric coords only
     if origin and dest:
@@ -2703,6 +2691,15 @@ def evidence_upload():
 
     return jsonify({"ok": True, "files": saved})
 
+# New route to serve uploaded evidence images
+@app.route("/api/evidence/view/<filename>")
+def view_evidence_image(filename):
+    """Serve uploaded images securely from the uploads directory."""
+    try:
+        return send_from_directory(UPLOAD_DIR, filename)
+    except FileNotFoundError:
+        return jsonify({"error": "File not found."}), 404
+    
 if __name__ == "__main__":
     # Run: python app.py
     app.run(host="0.0.0.0", port=5000, debug=False)
