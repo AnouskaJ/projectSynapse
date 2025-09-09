@@ -11,24 +11,18 @@ import "./styles/grabcar.css";
 export default function App() {
   return (
     <Routes>
-      {/* Public */}
       <Route path="/login" element={<Login />} />
 
-      {/* Protected */}
       <Route element={<ProtectedRoute />}>
-        {/* (optional) wrap Home with Shell for consistent chrome */}
         <Route path="/" element={<Home />} />
 
-        {/* Specific route goes before the param route */}
-        <Route path="/service/grabcar" element={<GrabCar />} />
+        {/* ✅ Changed path */}
+        <Route path="/service/agent" element={<GrabCar />} />
 
-        {/* Fallback for other services still using the old Scenario page */}
         <Route path="/service/:service" element={<Shell><Scenario /></Shell>} />
-
         <Route path="/custom" element={<Shell><Scenario isCustom /></Shell>} />
       </Route>
 
-      {/* Fallback */}
       <Route path="*" element={<Login />} />
     </Routes>
   );

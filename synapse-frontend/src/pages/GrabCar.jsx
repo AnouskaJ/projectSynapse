@@ -4,6 +4,7 @@ import { ensureFreshFcmToken } from "../lib/fcm-token";
 import { API_BASE } from "../config";
 import ImageAnswer from "../components/AgentStream/ImageAnswer.jsx";
 import MerchantMap from "../components/AgentStream/MerchantMap.jsx";
+import AltRoutesMap from "../components/AgentStream/AltRoutesMap.jsx";
 import "../styles/grabcar.css";
 
 // Layout/blocks
@@ -13,6 +14,7 @@ import KpiRow from "../components/ui/KpiRow.jsx";
 import ChainTimelineBox from "../components/agent/ChainTimelineBox.jsx";
 import AgentQuestions from "../components/agent/AgentQuestions.jsx";
 import SummaryCard from "../components/agent/SummaryCard.jsx";
+import ChainTimeline from "../components/agent/ChainTimeline.jsx";
 
 /** (Kept for fallback only; real tokens are fetched dynamically) */
 const HARDCODED_DRIVER_TOKEN = "fcm_dvr_6hJ9Q2vT8mN4aXs7bK1pR5eW3zL0cY8u";
@@ -73,6 +75,30 @@ const firstOf = (obj, keys, xform = (x) => x) => {
   }
   return undefined;
 };
+
+function pickBounds(src) {
+  const b =
+    src?.bounds ||
+    src?.viewport ||
+    src?.bbox ||
+    src?.boundingBox ||
+    src?.area ||
+    null;
+  if (!b) return null;
+  const south =
+    num(b.south) ?? num(b.s) ?? num(b.minLat) ?? num(b.minlat) ?? undefined;
+  const west =
+    num(b.west) ?? num(b.w) ?? num(b.minLng) ?? num(b.minlng) ?? num(b.minLon);
+  const north =
+    num(b.north) ?? num(b.n) ?? num(b.maxLat) ?? num(b.maxlat) ?? undefined;
+  const east =
+    num(b.east) ?? num(b.e) ?? num(b.maxLng) ?? num(b.maxlng) ?? num(b.maxLon);
+  if ([south, west, north, east].every((x) => Number.isFinite(x))) {
+    return { south, west, north, east };
+  }
+  return null;
+}
+
 function extractRoutingBits(ev) {
   const data = ev?.data || ev || {};
   const obs = data?.observation || ev?.observation || {};
@@ -119,12 +145,32 @@ function extractRoutingBits(ev) {
           firstOf(r, ["staticMapUrl", "static_url", "staticUrl"]) ??
           firstOf(rMap, ["staticMapUrl", "static_url", "StaticUrl"]) ??
           "",
+        summary: firstOf(r, ["summary", "name", "id"]) ?? `Route ${i + 1}`,
+        durationMin:
+          num(firstOf(r, ["duration_min", "durationMin"])) ??
+          num(firstOf(r, ["etaNoTraffic", "etaMin"])),
+        trafficMin: num(
+          firstOf(r, ["etaMin", "duration_traffic_min", "time_min"])
+        ),
         raw: r,
+        polyline:
+          r?.polyline ||
+          r?.encodedPolyline ||
+          r?.points ||
+          r?.overview_polyline?.points ||
+          r?.overview_polyline ||
+          rMap?.overview_polyline?.points ||
+          rMap?.overview_polyline ||
+          null,
+        path: r?.path,
       });
     });
   if (directAlts) consume(directAlts);
   else if (mapRoutes) consume(mapRoutes);
-  return { alternates: alts, mapUrl: embedUrl, staticUrl };
+
+  const bounds = pickBounds(map) || pickBounds(obs) || pickBounds(data) || null;
+
+  return { alternates: alts, mapUrl: embedUrl, staticUrl, bounds };
 }
 
 // notifications
@@ -147,9 +193,7 @@ async function notify(title, body) {
   } catch {}
 }
 
-/* Right panel map chooser:
-   - If staticUrl/embedUrl exists → iframe/static image (routes).
-   - Else if we have merchant pins → render MerchantMap. */
+/* Right panel map chooser */
 function MapPanel({ mapUrl, staticUrl, merchants, center }) {
   if (!mapUrl && !staticUrl && merchants?.length) {
     const c = center || {
@@ -189,7 +233,7 @@ function MapPanel({ mapUrl, staticUrl, merchants, center }) {
   );
 }
 
-// Prompt modal (polished, uses gs-* styles from grabcar.css)
+// Prompt modal
 function PromptModal({ open, initial, onClose, onSave }) {
   const [text, setText] = useState(initial || "");
   const [presetKey, setPresetKey] = useState("");
@@ -216,7 +260,6 @@ function PromptModal({ open, initial, onClose, onSave }) {
           <div className="gs-header-actions">
             <span className="gs-label">Preset</span>
 
-            {/* custom select with visible chevron */}
             <div className="relative">
               <select
                 className="gs-select"
@@ -301,10 +344,148 @@ function PromptModal({ open, initial, onClose, onSave }) {
   );
 }
 
+/** Clarify Modal */
+function ClarifyModal({
+  clarify,
+  answerDraft,
+  setAnswerDraft,
+  onClose,
+  onAnswer,
+  onUploadImages,
+}) {
+  if (!clarify) return null;
+
+  return (
+    <div className="gs-modal clarify-modal" role="dialog" aria-modal="true">
+      <div className="gs-modal-card">
+        <div className="gs-modal-header">
+          <div className="gs-title">Clarification needed</div>
+          <button className="gs-close" aria-label="Close" onClick={onClose}>
+            ×
+          </button>
+        </div>
+
+        <div className="gs-modal-body">
+          <div className="mb-3">
+            {clarify.question || "Please provide more information."}
+          </div>
+
+          {clarify.expected === "image[]" ? (
+            <ImageAnswer onSubmit={onUploadImages} />
+          ) : Array.isArray(clarify.options) && clarify.options.length > 0 ? (
+            <div className="flex flex-wrap gap-2">
+              {clarify.options.map((opt) => (
+                <button
+                  key={String(opt)}
+                  className="gt-choice-btn"
+                  onClick={() => onAnswer(String(opt))}
+                >
+                  {String(opt)}
+                </button>
+              ))}
+            </div>
+          ) : clarify.expected === "boolean" ? (
+            <div className="flex gap-2">
+              <button className="gt-choice-btn" onClick={() => onAnswer("yes")}>
+                Yes
+              </button>
+              <button className="gt-choice-btn" onClick={() => onAnswer("no")}>
+                No
+              </button>
+            </div>
+          ) : (
+            <div className="flex gap-2">
+              <input
+                autoFocus
+                className="gt-input flex-1"
+                placeholder="Type your answer…"
+                value={answerDraft}
+                onChange={(e) => setAnswerDraft(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && onAnswer(answerDraft)}
+              />
+              <button
+                className="gt-choice-btn"
+                onClick={() => onAnswer(answerDraft)}
+              >
+                Send
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Routes Modal (map + options) */
+function RoutesModal({ open, routes, bounds, onPick, onClose }) {
+  const [selIdx, setSelIdx] = useState(0);
+  if (!open || !Array.isArray(routes) || routes.length === 0) return null;
+
+  const questionRoutes = routes.map((r, i) => ({
+    name: r.name || r.summary || `Route ${i + 1}`,
+    etaMin: r.trafficMin ?? r.etaMin ?? r.durationMin ?? null,
+    etaNoTraffic: r.durationMin ?? r.etaNoTraffic ?? null,
+    distanceKm: r.distanceKm ?? r.distance_km ?? r.distance ?? null,
+    mapUrl: r.mapUrl || "",
+    staticMapUrl: r.staticMapUrl || "",
+    raw: r.raw ?? r,
+  }));
+
+  return (
+    <div className="gs-modal clarify-modal" role="dialog" aria-modal="true">
+      <div className="gs-modal-card" style={{ maxWidth: 980 }}>
+        <div className="gs-modal-header">
+          <div className="gs-title">Choose a route</div>
+          <button className="gs-close" aria-label="Close" onClick={onClose}>
+            ×
+          </button>
+        </div>
+
+        <div className="gs-modal-body">
+          <AltRoutesMap
+            routes={routes.map((r) => ({
+              summary: r.summary ?? r.name,
+              durationMin: r.durationMin ?? r.etaNoTraffic ?? r.etaMin,
+              trafficMin: r.trafficMin ?? r.etaMin,
+              polyline: r.polyline,
+              path: r.path,
+              overview_polyline: r.overview_polyline,
+            }))}
+            bounds={bounds || undefined}
+            selectedRoute={selIdx}
+            onChangeSelected={(i) => setSelIdx(i)}
+            onConfirm={(i) => onPick(i, questionRoutes[i])}
+          />
+
+          <div className="mt-4">
+            <AgentQuestions
+              routes={questionRoutes}
+              onPick={(i, r) => {
+                setSelIdx(i);
+                onPick(i, r);
+              }}
+            />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function GrabCar() {
   const [prompt, setPrompt] = useState("");
   const [scenarioText, setScenarioText] = useState("");
   const hasRun = useMemo(() => !!scenarioText, [scenarioText]);
+
+  // CMD overlay
+  const [overlayOpen, setOverlayOpen] = useState(() => {
+    return localStorage.getItem("gt.cmdOverlayDismissed") !== "1";
+  });
+  const overlayAutoOpenedRef = useRef(false);
+
+  // NEW: routes modal toggle
+  const [routesModalOpen, setRoutesModalOpen] = useState(false);
 
   const [showModal, setShowModal] = useState(false);
   const [showTicker, setShowTicker] = useState(true);
@@ -316,6 +497,7 @@ export default function GrabCar() {
 
   const [events, setEvents] = useState([]);
   const [alternates, setAlternates] = useState([]);
+  const [routeBounds, setRouteBounds] = useState(null);
   const [mapEmbed, setMapEmbed] = useState({ mapUrl: "", staticUrl: "" });
 
   // clarify/resume state
@@ -324,17 +506,41 @@ export default function GrabCar() {
   const [answerDraft, setAnswerDraft] = useState("");
   const resumeEsRef = useRef(null);
 
-  // merchant pins (for GrabFood alternates)
+  // merchant pins
   const [merchantPins, setMerchantPins] = useState([]);
   const [merchantCenter, setMerchantCenter] = useState(null);
 
-  // FCM tokens — dynamic (fixes INVALID_ARGUMENT)
+  // FCM tokens
   const [driverToken, setDriverToken] = useState("");
   const [passengerToken, setPassengerToken] = useState("");
   const [customerToken, setCustomerToken] = useState("");
 
   const altsShownRef = useRef(false);
   const lastSummaryRef = useRef("");
+  const notifiedRef = useRef(new Set()); // <<== notification deduper
+
+  // helper: notify once per logical key
+  function notifyOnce(key, title, body) {
+    if (!key) return;
+    if (notifiedRef.current.has(key)) return;
+    notifiedRef.current.add(key);
+    notify(title, body);
+  }
+
+  // Close overlay with ESC
+  useEffect(() => {
+    if (!overlayOpen) return;
+    const onKey = (e) => {
+      if (e.key === "Escape") {
+        setOverlayOpen(false);
+        try {
+          localStorage.setItem("gt.cmdOverlayDismissed", "1");
+        } catch {}
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [overlayOpen]);
 
   useEffect(() => {
     (async () => {
@@ -373,6 +579,18 @@ export default function GrabCar() {
     setPrompt(stored);
     if (stored) setScenarioText(stored);
   }, []);
+
+  // When a run starts, force-show overlay, and reset deduper
+  useEffect(() => {
+    if (hasRun) {
+      try {
+        localStorage.removeItem("gt.cmdOverlayDismissed");
+      } catch {}
+      setOverlayOpen(true);
+      overlayAutoOpenedRef.current = true;
+      notifiedRef.current.clear(); // reset per session
+    }
+  }, [hasRun]);
 
   // ---- resume SSE helper + resume functions ----
   function wireResumeSSE(url) {
@@ -480,7 +698,7 @@ export default function GrabCar() {
       setClarify(ev.data);
     }
 
-    // Merchant alternates (GrabFood): draw client-side map with pins
+    // Merchant alternates (GrabFood)
     const merchants =
       ev?.observation?.merchants ||
       ev?.data?.observation?.merchants ||
@@ -497,9 +715,19 @@ export default function GrabCar() {
     }
 
     // Route map state (GrabCar)
-    const { alternates: alts, mapUrl, staticUrl } = extractRoutingBits(ev);
+    const {
+      alternates: alts,
+      mapUrl,
+      staticUrl,
+      bounds,
+    } = extractRoutingBits(ev);
     if (alts.length) {
       setAlternates(alts);
+      if (bounds) setRouteBounds(bounds);
+
+      // Auto-open Routes modal when alternates appear
+      setRoutesModalOpen(true);
+
       if (!altsShownRef.current) {
         altsShownRef.current = true;
         const best = alts[0];
@@ -508,17 +736,16 @@ export default function GrabCar() {
               best.etaMin ?? "—"
             } min • ${best.distanceKm ?? "—"} km`
           : "Alternate routes are available.";
-        notify("GrabCar: Alternates found", msg);
+        notifyOnce(`alts:${sessionId}`, "GrabCar: Alternates found", msg);
       }
     }
     if (mapUrl || staticUrl) {
       setMapEmbed({ mapUrl: mapUrl || "", staticUrl: staticUrl || "" });
-      // Prefer route embed over merchant pins
       setMerchantPins([]);
       setMerchantCenter(null);
     }
 
-    // Collect summary text across agent variants
+    // Collect summary text (guard with lastSummaryRef)
     if (
       ev.type === "summary" ||
       ev.type === "final" ||
@@ -547,14 +774,16 @@ export default function GrabCar() {
         setSummary(str);
         if (str !== lastSummaryRef.current) {
           lastSummaryRef.current = str;
-          notify("GrabCar: Update", str);
+          // (Optional) If you want to notify summary, keep it single-shot per distinct text:
+          // notifyOnce(`summary:${sessionId}:${str.length}`, "GrabCar: Update", str);
         }
       }
     }
 
-    if (typeof ev.message === "string" && ev.message.trim()) {
-      notify("GrabCar", ev.message.trim());
-    }
+    // IMPORTANT: removed generic per-message notifier (this caused spam)
+    // if (typeof ev.message === "string" && ev.message.trim()) {
+    //   notify("GrabCar", ev.message.trim());
+    // }
   };
 
   const onPickRoute = (index, route) => {
@@ -586,18 +815,55 @@ export default function GrabCar() {
         ? `${route.etaNoTraffic} min (no traffic)`
         : "—";
     const distText = route?.distanceKm != null ? `${route.distanceKm} km` : "—";
-    notify(
+
+    notifyOnce(
+      `route:${sessionId}:${index}:${route?.name || index}`,
       "GrabCar: Route selected",
       `${route?.name || `Route ${index + 1}`}: ${etaText} • ${distText}`
     );
-    setAlternates([]);
+
+    // close the routes modal after selection
+    setRoutesModalOpen(false);
+    setAlternates([]); // hide questions after pick
   };
 
-  // --- compute whether a question panel is visible
   const hasQuestion = Boolean(clarify) || (alternates && alternates.length > 0);
 
   return (
     <div className="grabtaxi-page">
+      {/* ===== CMD overlay ===== */}
+      {overlayOpen && (
+        <div className="cmd-overlay" role="dialog" aria-modal="true">
+          <div className="cmd-window">
+            <div className="cmd-header">
+              <div className="cmd-title">
+                <span className="blink-dot" aria-hidden="true"></span>
+                <span>Live Agent Session</span>
+                <span className="cmd-session-id">
+                  {sessionId ? `#${String(sessionId).slice(-6)}` : "—"}
+                </span>
+              </div>
+              <button
+                className="cmd-close"
+                aria-label="Close"
+                title="Close (Esc)"
+                onClick={() => {
+                  setOverlayOpen(false);
+                  try {
+                    localStorage.setItem("gt.cmdOverlayDismissed", "1");
+                  } catch {}
+                }}
+              >
+                ×
+              </button>
+            </div>
+            <div className="cmd-body">
+              <ChainTimeline events={events} />
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* TOPBAR */}
       <TopBar title="ProjectSynapse" onOpenPrompt={() => setShowModal(true)} />
 
@@ -635,80 +901,19 @@ export default function GrabCar() {
             </div>
           )}
 
-          {/* Timeline (auto-grow to full height when there’s no question panel) */}
           <ChainTimelineBox
             className="mt-3"
             title="Agent Timeline"
             events={events}
             fullHeight={!hasQuestion}
+            onMaximize={() => setOverlayOpen(true)}
           />
 
-          {/* Clarify UI */}
-          {clarify && (
-            <div className="gt-card p-3 mt-3">
-              <div className="flex items-center justify-between mb-2">
-                <div className="text-sm font-semibold">Clarification needed</div>
-                <div className="gt-dim text-xs">awaiting</div>
-              </div>
-              <div className="mb-3">
-                {clarify.question || "Please provide more information."}
-              </div>
-
-              {clarify.expected === "image[]" ? (
-                <ImageAnswer onSubmit={uploadImagesAndResume} />
-              ) : Array.isArray(clarify.options) && clarify.options.length > 0 ? (
-                <div className="flex flex-wrap gap-2">
-                  {clarify.options.map((opt) => (
-                    <button
-                      key={opt}
-                      className="gt-choice-btn"
-                      onClick={() => resumeWithAnswer(String(opt))}
-                    >
-                      {String(opt)}
-                    </button>
-                  ))}
-                </div>
-              ) : clarify.expected === "boolean" ? (
-                <div className="flex gap-2">
-                  <button
-                    className="gt-choice-btn"
-                    onClick={() => resumeWithAnswer("yes")}
-                  >
-                    Yes
-                  </button>
-                  <button
-                    className="gt-choice-btn"
-                    onClick={() => resumeWithAnswer("no")}
-                  >
-                    No
-                  </button>
-                </div>
-              ) : (
-                <div className="flex gap-2">
-                  <input
-                    className="gt-input flex-1"
-                    placeholder="Type your answer…"
-                    value={answerDraft}
-                    onChange={(e) => setAnswerDraft(e.target.value)}
-                    onKeyDown={(e) =>
-                      e.key === "Enter" && resumeWithAnswer(answerDraft)
-                    }
-                  />
-                  <button
-                    className="gt-choice-btn"
-                    onClick={() => resumeWithAnswer(answerDraft)}
-                  >
-                    Send
-                  </button>
-                </div>
-              )}
-            </div>
+          {/* Hide questions list on page when routes modal is open */}
+          {!routesModalOpen && !overlayOpen && (
+            <AgentQuestions routes={alternates} onPick={onPickRoute} />
           )}
 
-          {/* Route suggestions */}
-          <AgentQuestions routes={alternates} onPick={onPickRoute} />
-
-          {/* SSE runner */}
           {hasRun && (
             <AgentRunner
               scenarioText={scenarioText}
@@ -729,10 +934,8 @@ export default function GrabCar() {
                     ? s.join("\n")
                     : (s && (s.text || s.message)) || "";
                 setSummary(text);
-                if (text && text !== lastSummaryRef.current) {
-                  lastSummaryRef.current = text;
-                  notify("GrabCar: Update", text);
-                }
+                // We no longer notify here to avoid double toasts;
+                // handleEvent() manages summary changes with lastSummaryRef.
               }}
               onEvent={handleEvent}
             />
@@ -771,6 +974,7 @@ export default function GrabCar() {
         </section>
       </div>
 
+      {/* Prompt modal */}
       <PromptModal
         open={showModal}
         initial={prompt}
@@ -796,7 +1000,39 @@ export default function GrabCar() {
           resumeEsRef.current = null;
           altsShownRef.current = false;
           lastSummaryRef.current = "";
+
+          // FORCE open CMD overlay for a new session
+          try {
+            localStorage.removeItem("gt.cmdOverlayDismissed");
+          } catch {}
+          setOverlayOpen(true);
+
+          // reset guards
+          setRoutesModalOpen(false);
+          overlayAutoOpenedRef.current = true;
+
+          // reset notification deduper for the new run
+          notifiedRef.current.clear();
         }}
+      />
+
+      {/* Clarify modal */}
+      <ClarifyModal
+        clarify={clarify}
+        answerDraft={answerDraft}
+        setAnswerDraft={setAnswerDraft}
+        onClose={() => setClarify(null)}
+        onAnswer={(ans) => resumeWithAnswer(ans)}
+        onUploadImages={(files) => uploadImagesAndResume(files)}
+      />
+
+      {/* Routes modal (map + options + default route) */}
+      <RoutesModal
+        open={routesModalOpen && alternates.length > 0}
+        routes={alternates}
+        bounds={routeBounds}
+        onPick={onPickRoute}
+        onClose={() => setRoutesModalOpen(false)}
       />
     </div>
   );

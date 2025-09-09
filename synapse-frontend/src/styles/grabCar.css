@@ -420,6 +420,15 @@ html, body, #root, .grabtaxi-page{
   margin-top: 12px;
 }
 
+/* Base input (used in clarify modal free-text) */
+.gt-input{
+  background: rgba(255,255,255,0.06);
+  border: 1px solid color-mix(in oklab, var(--grab-edge) 70%, transparent);
+  border-radius: 10px;
+  padding: 10px 12px;
+  color: var(--grab-text);
+}
+
 /* Obvious focus states everywhere */
 button:focus-visible, .btn:focus-visible, .gt-input:focus-visible,
 .gs-select:focus-visible, .gs-textarea:focus-visible {
@@ -442,3 +451,80 @@ button:focus-visible, .btn:focus-visible, .gt-input:focus-visible,
   max-height: none;          /* override default cap */
   min-height: 0;             /* allow proper flex scrolling */
 }
+
+/* ================================================================== */
+/* ================= CMD-Style Timeline Overlay ===================== */
+/* ================================================================== */
+
+/* Put overlay below the ticker (200) but above page content. */
+.cmd-overlay{
+  position: fixed; inset: 0; z-index: 160;
+  background: rgba(2,6,23,0.60);
+  backdrop-filter: blur(6px);
+}
+.cmd-window{
+  position: absolute; top: 16px; right: 16px; bottom: 16px; left: 16px;
+  border-radius: 14px;
+  border: 1px solid color-mix(in oklab, var(--grab-edge) 70%, transparent);
+  box-shadow: 0 30px 80px rgba(0,0,0,.45);
+  display: flex; flex-direction: column;
+  background:
+    radial-gradient(1200px 800px at 50% 10%, rgba(0,0,0,.78), rgba(0,0,0,.92)),
+    repeating-linear-gradient(0deg, rgba(255,255,255,0.02) 0px, rgba(255,255,255,0.02) 1px, transparent 1px, transparent 2px);
+}
+.cmd-header{
+  display:flex; align-items:center; justify-content:space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid color-mix(in oklab, var(--grab-edge) 60%, transparent);
+  background: linear-gradient(180deg, rgba(0,0,0,.35), rgba(0,0,0,.2));
+}
+.cmd-title{
+  display:flex; align-items:center; gap:10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 13px; letter-spacing:.2px;
+  color: #b5f5b5;
+}
+.blink-dot{ width:10px; height:10px; border-radius:999px; background:#22c55e; box-shadow: 0 0 10px #22c55e; animation: blink 1.2s infinite; }
+.cmd-session-id{ color: var(--grab-muted); }
+.cmd-close{
+  all: unset; cursor: pointer; line-height: 1;
+  font-size: 20px; color: var(--grab-muted);
+  padding: 6px 10px; border-radius: 8px;
+}
+.cmd-close:hover{ background: rgba(255,255,255,0.06); color: var(--grab-text); }
+.cmd-body{
+  flex:1; overflow:auto; padding: 12px;
+  color: var(--grab-text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+.cmd-body .gt-card{ background: transparent; border: 0; box-shadow:none; }
+.cmd-body .gt-timeline-scroll{ max-height: unset; }
+
+/* Clarify modal must float above the CMD overlay */
+.clarify-modal.gs-modal{ z-index: 180; }
+.clarify-modal .gs-modal-card{ max-width: 720px; }
+
+
+/* ===== AltRoutesMap floating selector ===== */
+.altmap-wrap { position: relative; }
+.altmap-overlay {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 2;
+}
+.altmap-box {
+  display: grid;
+  gap: 6px;
+  min-width: 220px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in oklab, var(--grab-edge) 70%, transparent);
+  background:
+    linear-gradient(180deg, color-mix(in oklab, var(--grab-panel) 94%, transparent), transparent),
+    linear-gradient(90deg, color-mix(in oklab, var(--theme-map-start) 10%, transparent), transparent);
+  box-shadow: 0 10px 26px rgb(2 6 23 / 35%);
+}
+.altmap-box-title { font-weight: 700; }
+.altmap-box-meta { font-size: .9rem; color: var(--grab-muted); }
+.altmap-box .muted { color: var(--grab-muted); }
