@@ -4,6 +4,27 @@ import { usePrompt } from "../../lib/promptStore";
 import { useNavigate } from "react-router-dom";
 import { ChevronRight } from "lucide-react";
 
+// Add the scenario presets here to keep them self-contained
+const SCENARIO_PRESETS = {
+  grabfood: {
+    title: "GrabFood",
+    scenario: "Order GF-10234 from 'Nasi Goreng House, Velachery' to DLF IT Park, Manapakkam. Kitchen is quoting a 45 minute prep time and the driver is waiting. Proactively inform the customer, minimize driver idle time, and suggest faster nearby alternatives.",
+  },
+  grabmart: {
+    title: "GrabMart – Damage Dispute",
+    scenario: "Order GM-20987 from 'QuickMart, T. Nagar' to Olympia Tech Park, Guindy. At the doorstep, the customer reports a spilled drink. It's unclear if this is merchant or driver fault. Mediate the dispute fairly on-site.",
+  },
+  grabexpress: {
+    title: "GrabExpress",
+    scenario: "A valuable parcel is being delivered to Adyar. The driver has arrived but the recipient is not responding. Initiate contact, and if they can't receive it, suggest a safe drop-off or a nearby secure locker.",
+  },
+  grabcar: {
+    title: "GrabCar",
+    scenario: "An urgent airport ride from SRMIST Chennai to Chennai International Airport (MAA) for flight 6E 5119. A major accident is blocking the main route. Find the fastest alternative and inform both passenger and driver.",
+  },
+};
+
+
 export default function PromptCard() {
   const { user } = useAuth();
   const [prompt, setPrompt] = usePrompt("");
@@ -111,6 +132,24 @@ export default function PromptCard() {
           </button>
         </div>
       </div>
+
+      {/* NEW: Sample scenario buttons */}
+      <div className="mb-4">
+        <h3 className="text-sm font-semibold text-[var(--grab-muted)] mb-2">Sample Scenarios</h3>
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+          {Object.entries(SCENARIO_PRESETS).map(([key, preset]) => (
+            <button
+              key={key}
+              type="button"
+              onClick={() => setPrompt(preset.scenario)}
+              className="w-full text-left rounded-lg border border-[var(--grab-edge)] px-3 py-2 text-sm font-medium hover:bg-white/5 transition"
+            >
+              {preset.title}
+            </button>
+          ))}
+        </div>
+      </div>
+
 
       {/* textarea with inline arrow action */}
       <div className="relative mt-2 rounded-xl border border-[var(--grab-edge)] focus-within:border-[var(--grab-accent)] transition">

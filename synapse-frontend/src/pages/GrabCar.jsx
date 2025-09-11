@@ -1,3 +1,5 @@
+// src/pages/GrabCar.jsx
+
 import { useEffect, useMemo, useRef, useState } from "react";
 import AgentRunner from "../components/agent/AgentRunner.jsx";
 import { ensureFreshFcmToken } from "../lib/fcm-token";
@@ -5,7 +7,8 @@ import { API_BASE } from "../config";
 import ImageAnswer from "../components/AgentStream/ImageAnswer.jsx";
 import MerchantMap from "../components/AgentStream/MerchantMap.jsx";
 import AltRoutesMap from "../components/AgentStream/AltRoutesMap.jsx";
-import "../styles/grabcar.css";
+import MapBox from "../components/AgentStream/MapBox.jsx";
+import "../styles/grabCar.css";
 
 // Layout/blocks
 import Sidebar from "../components/dashboard/Sidebar.jsx";
@@ -14,7 +17,9 @@ import KpiRow from "../components/ui/KpiRow.jsx";
 import ChainTimelineBox from "../components/agent/ChainTimelineBox.jsx";
 import AgentQuestions from "../components/agent/AgentQuestions.jsx";
 import SummaryCard from "../components/agent/SummaryCard.jsx";
-import ChainTimeline from "../components/agent/ChainTimeline.jsx";
+
+// NEW: Step output component for the right panel
+import StepOutput from "../components/agent/StepOutput.jsx";
 
 /** (Kept for fallback only; real tokens are fetched dynamically) */
 const HARDCODED_DRIVER_TOKEN = "fcm_dvr_6hJ9Q2vT8mN4aXs7bK1pR5eW3zL0cY8u";
@@ -143,7 +148,7 @@ function extractRoutingBits(ev) {
           "",
         staticMapUrl:
           firstOf(r, ["staticMapUrl", "static_url", "staticUrl"]) ??
-          firstOf(rMap, ["staticMapUrl", "static_url", "StaticUrl"]) ??
+          firstOf(rMap, ["staticMapUrl", "static_url", "staticUrl"]) ??
           "",
         summary: firstOf(r, ["summary", "name", "id"]) ?? `Route ${i + 1}`,
         durationMin:
@@ -191,46 +196,6 @@ async function notify(title, body) {
   try {
     new Notification(title, { body });
   } catch {}
-}
-
-/* Right panel map chooser */
-function MapPanel({ mapUrl, staticUrl, merchants, center }) {
-  if (!mapUrl && !staticUrl && merchants?.length) {
-    const c = center || {
-      lat: merchants[0]?.lat,
-      lng: merchants[0]?.lng ?? merchants[0]?.lon,
-    };
-    return (
-      <div className="map-frame">
-        <MerchantMap center={c} merchants={merchants} />
-      </div>
-    );
-  }
-  if (staticUrl) {
-    return (
-      <div className="map-frame">
-        <img src={staticUrl} alt="route" className="h-auto w-full" />
-      </div>
-    );
-  }
-  if (mapUrl) {
-    return (
-      <div className="map-frame">
-        <iframe
-          key={mapUrl}
-          title="map"
-          src={mapUrl}
-          allowFullScreen
-          loading="lazy"
-        />
-      </div>
-    );
-  }
-  return (
-    <div className="gt-card p-4 text-sm text-[var(--grab-muted)]">
-      Map will render once available.
-    </div>
-  );
 }
 
 // Prompt modal
@@ -478,12 +443,6 @@ export default function GrabCar() {
   const [scenarioText, setScenarioText] = useState("");
   const hasRun = useMemo(() => !!scenarioText, [scenarioText]);
 
-  // CMD overlay
-  const [overlayOpen, setOverlayOpen] = useState(() => {
-    return localStorage.getItem("gt.cmdOverlayDismissed") !== "1";
-  });
-  const overlayAutoOpenedRef = useRef(false);
-
   // NEW: routes modal toggle
   const [routesModalOpen, setRoutesModalOpen] = useState(false);
 
@@ -499,6 +458,7 @@ export default function GrabCar() {
   const [alternates, setAlternates] = useState([]);
   const [routeBounds, setRouteBounds] = useState(null);
   const [mapEmbed, setMapEmbed] = useState({ mapUrl: "", staticUrl: "" });
+  const [selectedStep, setSelectedStep] = useState(null);
 
   // clarify/resume state
   const [sessionId, setSessionId] = useState("");
@@ -518,6 +478,7 @@ export default function GrabCar() {
   const altsShownRef = useRef(false);
   const lastSummaryRef = useRef("");
   const notifiedRef = useRef(new Set()); // <<== notification deduper
+  const seenEventTypes = useRef(new Set()); // NEW: Ref to track seen events
 
   // helper: notify once per logical key
   function notifyOnce(key, title, body) {
@@ -526,21 +487,6 @@ export default function GrabCar() {
     notifiedRef.current.add(key);
     notify(title, body);
   }
-
-  // Close overlay with ESC
-  useEffect(() => {
-    if (!overlayOpen) return;
-    const onKey = (e) => {
-      if (e.key === "Escape") {
-        setOverlayOpen(false);
-        try {
-          localStorage.setItem("gt.cmdOverlayDismissed", "1");
-        } catch {}
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [overlayOpen]);
 
   useEffect(() => {
     (async () => {
@@ -580,15 +526,12 @@ export default function GrabCar() {
     if (stored) setScenarioText(stored);
   }, []);
 
-  // When a run starts, force-show overlay, and reset deduper
+  // When a run starts, reset everything
   useEffect(() => {
     if (hasRun) {
-      try {
-        localStorage.removeItem("gt.cmdOverlayDismissed");
-      } catch {}
-      setOverlayOpen(true);
-      overlayAutoOpenedRef.current = true;
       notifiedRef.current.clear(); // reset per session
+      seenEventTypes.current.clear(); // NEW: Reset seen events
+      setSelectedStep(null); // Clear selected step on new run
     }
   }, [hasRun]);
 
@@ -615,6 +558,7 @@ export default function GrabCar() {
       } catch {}
     };
     es.onerror = () => {
+      onEvent?.({ type: "error", error: "Stream error" });
       try {
         es.close();
       } catch {}
@@ -658,7 +602,6 @@ export default function GrabCar() {
     });
     const { files = [] } = await up.json();
     setClarify(null);
-    setAnswerDraft("");
     const qs = new URLSearchParams({
       session_id: sessionId,
       question_id: clarify.question_id || "evidence_images",
@@ -671,21 +614,24 @@ export default function GrabCar() {
 
   const handleEvent = (incoming) => {
     if (!incoming || typeof incoming !== "object") return;
+    const ev = { ...incoming };
 
-    const ev = {
-      ...incoming,
-      params:
-        incoming.params ??
-        incoming.data?.params ??
-        incoming?.observation?.params,
-      observation: incoming.observation ?? incoming.data?.observation,
-      message:
-        incoming.message ??
-        incoming.data?.message ??
-        incoming.observation?.message ??
-        incoming.data?.observation?.message,
-      tool: incoming.tool ?? incoming.data?.tool ?? incoming.observation?.tool,
-    };
+    // Filter logic
+    const type = ev.type?.toLowerCase() || '';
+    const isUnwanted = type === 'event' || type === 'done' || type === 'session';
+    const isClassification = type === 'classification';
+    const isSeenClassification = seenEventTypes.current.has('classification');
+
+    // Deduplicate classification and filter out unwanted events
+    if (isUnwanted || (isClassification && isSeenClassification)) {
+        if (isClassification && !isSeenClassification) {
+            seenEventTypes.current.add('classification');
+        }
+        return;
+    }
+    if (isClassification) {
+        seenEventTypes.current.add('classification');
+    }
 
     setEvents((prev) => [...prev, ev]);
 
@@ -698,19 +644,22 @@ export default function GrabCar() {
       setClarify(ev.data);
     }
 
-    // Merchant alternates (GrabFood)
+    // Merchant alternates (GrabFood), Lockers (GrabExpress)
     const merchants =
       ev?.observation?.merchants ||
       ev?.data?.observation?.merchants ||
       ev?.data?.merchants;
-    if (Array.isArray(merchants) && merchants.length > 0) {
-      setMerchantPins(merchants);
+    const lockers = ev?.observation?.lockers || ev?.data?.observation?.lockers;
+    const locations = merchants || lockers;
+    
+    if (Array.isArray(locations) && locations.length > 0) {
+      setMerchantPins(locations);
       const latParam =
-        num(firstOf(ev.params, ["lat", "latitude"])) ?? merchants[0]?.lat;
+        num(firstOf(ev.params, ["lat", "latitude"])) ?? locations[0]?.lat;
       const lonParam =
         num(firstOf(ev.params, ["lon", "lng", "longitude"])) ??
-        merchants[0]?.lng ??
-        merchants[0]?.lon;
+        locations[0]?.lng ??
+        locations[0]?.lon;
       setMerchantCenter({ lat: latParam, lng: lonParam });
     }
 
@@ -774,96 +723,90 @@ export default function GrabCar() {
         setSummary(str);
         if (str !== lastSummaryRef.current) {
           lastSummaryRef.current = str;
-          // (Optional) If you want to notify summary, keep it single-shot per distinct text:
-          // notifyOnce(`summary:${sessionId}:${str.length}`, "GrabCar: Update", str);
         }
       }
     }
-
-    // IMPORTANT: removed generic per-message notifier (this caused spam)
-    // if (typeof ev.message === "string" && ev.message.trim()) {
-    //   notify("GrabCar", ev.message.trim());
-    // }
   };
 
-  const onPickRoute = (index, route) => {
-    setEvents((prev) => [
-      ...prev,
-      {
-        type: "step",
-        at: new Date().toISOString(),
-        data: {
-          intent: "route_selected",
-          params: { index, title: route?.name || `Route ${index + 1}` },
-        },
+const onPickRoute = (index, route) => {
+  setEvents((prev) => [
+    ...prev,
+    {
+      type: "step",
+      at: new Date().toISOString(),
+      data: {
+        intent: "route_selected",
+        params: { index, title: route?.name || `Route ${index + 1}` },
       },
-    ]);
+      passed: true, // ✅ Add this line to explicitly mark the step as passed
+    },
+  ]);
 
-    if (route?.mapUrl || route?.staticMapUrl) {
-      setMapEmbed({
-        mapUrl: route.mapUrl || "",
-        staticUrl: route.staticMapUrl || "",
+  if (route?.mapUrl || route?.staticMapUrl) {
+    setMapEmbed({
+      mapUrl: route.mapUrl || "",
+      staticUrl: route.staticMapUrl || "",
+    });
+    setMerchantPins([]);
+    setMerchantCenter(null);
+  }
+
+  const etaText =
+    route?.etaMin != null
+      ? `${route.etaMin} min`
+      : route?.etaNoTraffic != null
+      ? `${route.etaNoTraffic} min (no traffic)`
+      : "—";
+  const distText = route?.distanceKm != null ? `${route.distanceKm} km` : "—";
+
+  notifyOnce(
+    `route:${sessionId}:${index}:${route?.name || index}`,
+    "GrabCar: Route selected",
+    `${route?.name || `Route ${index + 1}`}: ${etaText} • ${distText}`
+  );
+
+  // close the routes modal after selection
+  setRoutesModalOpen(false);
+  setAlternates([]); // hide questions after pick
+};
+
+  const onStepClick = (step) => {
+    setSelectedStep(step);
+  };
+
+  const onSummaryClick = () => {
+    // Manually create a "step-like" object for the summary to be displayed in the right panel
+    const summaryEvent = events.find(ev => ev.type === 'summary');
+    if (summaryEvent) {
+      setSelectedStep({
+        intent: "Summary",
+        tool: "summary_report",
+        params: {},
+        observation: { message: summaryEvent.data?.message || summaryEvent.data?.summary },
+        passed: true,
+        final_message: summary,
       });
-      setMerchantPins([]);
-      setMerchantCenter(null);
     }
-
-    const etaText =
-      route?.etaMin != null
-        ? `${route.etaMin} min`
-        : route?.etaNoTraffic != null
-        ? `${route.etaNoTraffic} min (no traffic)`
-        : "—";
-    const distText = route?.distanceKm != null ? `${route.distanceKm} km` : "—";
-
-    notifyOnce(
-      `route:${sessionId}:${index}:${route?.name || index}`,
-      "GrabCar: Route selected",
-      `${route?.name || `Route ${index + 1}`}: ${etaText} • ${distText}`
-    );
-
-    // close the routes modal after selection
-    setRoutesModalOpen(false);
-    setAlternates([]); // hide questions after pick
   };
 
   const hasQuestion = Boolean(clarify) || (alternates && alternates.length > 0);
+  
+  const rightPanelMapData = useMemo(() => {
+    if (selectedStep) {
+      const { map } = selectedStep?.observation || {};
+      if (map) {
+        if (map.kind === "directions" && map.routes) {
+          return { ...map, alternates: map.routes };
+        }
+        return map;
+      }
+    }
+    return { mapUrl: mapEmbed.mapUrl, staticUrl: mapEmbed.staticUrl, merchants: merchantPins, center: merchantCenter };
+  }, [selectedStep, mapEmbed, merchantPins, merchantCenter]);
+
 
   return (
     <div className="grabtaxi-page">
-      {/* ===== CMD overlay ===== */}
-      {overlayOpen && (
-        <div className="cmd-overlay" role="dialog" aria-modal="true">
-          <div className="cmd-window">
-            <div className="cmd-header">
-              <div className="cmd-title">
-                <span className="blink-dot" aria-hidden="true"></span>
-                <span>Live Agent Session</span>
-                <span className="cmd-session-id">
-                  {sessionId ? `#${String(sessionId).slice(-6)}` : "—"}
-                </span>
-              </div>
-              <button
-                className="cmd-close"
-                aria-label="Close"
-                title="Close (Esc)"
-                onClick={() => {
-                  setOverlayOpen(false);
-                  try {
-                    localStorage.setItem("gt.cmdOverlayDismissed", "1");
-                  } catch {}
-                }}
-              >
-                ×
-              </button>
-            </div>
-            <div className="cmd-body">
-              <ChainTimeline events={events} />
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* TOPBAR */}
       <TopBar title="ProjectSynapse" onOpenPrompt={() => setShowModal(true)} />
 
@@ -873,7 +816,7 @@ export default function GrabCar() {
         <aside className="gt-sidebar">
           <Sidebar />
         </aside>
-
+        
         {/* MIDDLE */}
         <main className="gt-middle">
           {showTicker && (
@@ -906,11 +849,12 @@ export default function GrabCar() {
             title="Agent Timeline"
             events={events}
             fullHeight={!hasQuestion}
-            onMaximize={() => setOverlayOpen(true)}
+            onStepClick={onStepClick}
+            onSummaryClick={onSummaryClick}
           />
 
           {/* Hide questions list on page when routes modal is open */}
-          {!routesModalOpen && !overlayOpen && (
+          {!routesModalOpen && (
             <AgentQuestions routes={alternates} onPick={onPickRoute} />
           )}
 
@@ -934,8 +878,6 @@ export default function GrabCar() {
                     ? s.join("\n")
                     : (s && (s.text || s.message)) || "";
                 setSummary(text);
-                // We no longer notify here to avoid double toasts;
-                // handleEvent() manages summary changes with lastSummaryRef.
               }}
               onEvent={handleEvent}
             />
@@ -960,17 +902,17 @@ export default function GrabCar() {
               { label: "Alerts", value: alerts ?? 0, badge: true },
             ]}
           />
+          
+          {selectedStep ? (
+            <>
+              <div className="mt-3">
+                <StepOutput step={selectedStep} />
+              </div>
+            </>
+          ) : (
+            <SummaryCard summary={summary} className="mt-3" />
+          )}
 
-          <div className="mt-3">
-            <MapPanel
-              mapUrl={mapEmbed.mapUrl}
-              staticUrl={mapEmbed.staticUrl}
-              merchants={merchantPins}
-              center={merchantCenter}
-            />
-          </div>
-
-          <SummaryCard summary={summary} className="mt-3" />
         </section>
       </div>
 
@@ -1001,15 +943,8 @@ export default function GrabCar() {
           altsShownRef.current = false;
           lastSummaryRef.current = "";
 
-          // FORCE open CMD overlay for a new session
-          try {
-            localStorage.removeItem("gt.cmdOverlayDismissed");
-          } catch {}
-          setOverlayOpen(true);
-
           // reset guards
           setRoutesModalOpen(false);
-          overlayAutoOpenedRef.current = true;
 
           // reset notification deduper for the new run
           notifiedRef.current.clear();

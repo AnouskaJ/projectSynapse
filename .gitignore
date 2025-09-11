@@ -1,14 +1,11 @@
 # Ignore config files with secrets
 synapseFlask/config.json
-<<<<<<< HEAD
 synapse-frontend/src/config.js 
-=======
-synapse-frontend\src\config.js
->>>>>>> 74923795b967ed8d74693572f0590ee56f5dd59f
-synapseFlask\synapse-54cfb-firebase-adminsdk-fbsvc-6d63c78be8.json
-# Optional: also ignore service account JSONs
-*.json
-!package.json   # keep Node's package.json if needed
+synapseFlask/synapse-54cfb-firebase-adminsdk-fbsvc-6d63c78be8.json
+
+# Flask uploads & evidence (user data, temp files)
+synapseFlask/uploads/
+synapseFlask/evidence/
 
 # Python artifacts
 __pycache__/

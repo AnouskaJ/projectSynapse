@@ -6,7 +6,7 @@
   --grab-muted:#9aa5b3;
   --grab-text:#e6ebf2;
   --grab-accent:#2bd4ff;    /* cyan */
-  --grab-accent-2:#8b5cf6;  /* violet */
+  --grab-accent-2:#8b5cf6; 
   --grab-ok:#22c55e;
   --grab-warn:#f59e0b;
   --grab-radius:16px;
@@ -429,6 +429,35 @@ html, body, #root, .grabtaxi-page{
   color: var(--grab-text);
 }
 
+/* Make right panel independently scrollable */
+.gt-right {
+  display: flex;
+  flex-direction: column;
+  /* This calculation sets the height to the viewport height minus the space taken by the header and padding. */
+  max-height: calc(100vh - var(--topbar-offset) - 40px);
+  overflow-y: auto; /* This enables vertical scrolling for the block when content overflows. */
+}
+/* Custom scrollbar for the right panel, matching the left one */
+.gt-right::-webkit-scrollbar{ width: 8px; }
+.gt-right::-webkit-scrollbar-track{
+  background: color-mix(in oklab, var(--grab-panel) 88%, transparent);
+  border: 1px solid color-mix(in oklab, var(--grab-edge) 65%, transparent);
+  border-radius: 999px;
+}
+.gt-right::-webkit-scrollbar-thumb{
+  background: linear-gradient(180deg,
+    color-mix(in oklab, var(--theme-timeline-start) 50%, var(--grab-edge)),
+    color-mix(in oklab, var(--theme-timeline-end) 50%, var(--grab-edge))
+  );
+  border-radius: 999px;
+  border: 2px solid color-mix(in oklab, var(--grab-panel) 92%, transparent);
+}
+.gt-right{
+  scrollbar-width: thin;
+  scrollbar-color:
+    color-mix(in oklab, var(--theme-timeline-start) 55%, var(--grab-edge))
+    color-mix(in oklab, var(--grab-panel) 90%, transparent);
+}
 /* Obvious focus states everywhere */
 button:focus-visible, .btn:focus-visible, .gt-input:focus-visible,
 .gs-select:focus-visible, .gs-textarea:focus-visible {

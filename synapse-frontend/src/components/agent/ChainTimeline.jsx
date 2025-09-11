@@ -87,9 +87,20 @@ function KeyVal({ title, data }) {
   );
 }
 
-export default function ChainTimeline({ events }) {
+export default function ChainTimeline({ events, onStepClick, onSummaryClick }) {
   if (!events?.length) {
     return <div className="gt-empty gt-card text-sm">Waiting for events…</div>;
+  }
+  
+  // Filter out the events we don't want to show
+  const filteredEvents = events.filter(ev => {
+    const t = ev?.type?.toLowerCase() || "";
+    // Only display classifications, steps, summaries, clarifies, and errors
+    return ["classification", "step", "summary", "clarify", "error"].includes(t);
+  });
+
+  if (!filteredEvents.length) {
+     return <div className="gt-empty gt-card text-sm">Waiting for events…</div>;
   }
 
   const pullMessage = (ev) =>
@@ -100,7 +111,7 @@ export default function ChainTimeline({ events }) {
 
   return (
     <div className="gt-timeline-scroll">
-      {events.map((ev, i) => {
+      {filteredEvents.map((ev, i) => {
         const t = ev?.type || "event";
         const data = ev?.data || {};
         const pill =
@@ -129,8 +140,18 @@ export default function ChainTimeline({ events }) {
 
         const friendlyMsg = pullMessage(ev);
 
+        const isClickable = t === "step" || t === "summary";
+        const itemClass = `gt-timeline-item ${isClickable ? "cursor-pointer hover:bg-white/5" : ""}`;
+        
         return (
-          <div key={i} className="gt-timeline-item">
+          <div
+            key={i}
+            className={itemClass}
+            onClick={isClickable ? () => {
+              if (t === 'step') onStepClick(ev.data);
+              if (t === 'summary') onSummaryClick(ev.data);
+            } : undefined}
+          >
             <div className="flex items-center gap-2">
               <span className="gt-pill">{pill}</span>
               {t === "step" && typeof data?.index === "number" && (
@@ -177,26 +198,7 @@ export default function ChainTimeline({ events }) {
                 </div>
               )}
             </div>
-
-            {typeof friendlyMsg === "string" && friendlyMsg.trim() && (
-              <details className="gt-collapse mt-2">
-                <summary>Message</summary>
-                <div className="mt-2">
-                  <CollapsibleValue value={friendlyMsg} />
-                </div>
-              </details>
-            )}
-
-            {t === "step" && (
-              <details className="gt-collapse mt-2">
-                <summary>Details</summary>
-                <div className="mt-2 space-y-3">
-                  <KeyVal title="Tool" data={data.tool ? { tool: data.tool } : null} />
-                  <KeyVal title="Params" data={ev.params || data.params} />
-                  <KeyVal title="Observation" data={ev.observation || data.observation} />
-                </div>
-              </details>
-            )}
+            {/* Removed the entire 'Details' section from here */}
           </div>
         );
       })}

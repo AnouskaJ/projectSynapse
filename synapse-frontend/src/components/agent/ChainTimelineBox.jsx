@@ -10,6 +10,8 @@ export default function ChainTimelineBox({
   className = "",
   fullHeight = false,
   onMaximize, // ← new (optional) prop
+  onStepClick, // 👈 New prop
+  onSummaryClick, // 👈 New prop
 }) {
   const rootCls = [
     "gt-card",
@@ -38,7 +40,8 @@ export default function ChainTimelineBox({
           <div className="gt-dim text-xs">{events?.length ?? 0} items</div>
         </div>
       </div>
-      <ChainTimeline events={events} />
+      {/* 👈 Pass the new props down to the child component */}
+      <ChainTimeline events={events} onStepClick={onStepClick} onSummaryClick={onSummaryClick} />
     </div>
   );
 }

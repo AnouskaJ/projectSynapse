@@ -3,7 +3,11 @@ import { useEffect, useState } from "react";
 export default function LiveTickerOverlay({
   onClose,
   line1 = "Real-time feed connected",
+<<<<<<< HEAD
   line2 = "Driver locations updating every 10s",
+=======
+  line2 = "Data updating every 10s",
+>>>>>>> e2d77e6 (Chore: made minor modifications to the frontend design)
 }) {
   const [visible, setVisible] = useState(true);
   useEffect(() => {
