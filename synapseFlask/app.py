@@ -2482,17 +2482,17 @@ def resolve_sync_endpoint():
         return jsonify({"error":"missing scenario"
                         }), 400
 
-    origin_q = data.get("origin")
-    dest_q   = data.get("dest")
+    origin = data.get("origin")
+    dest   = data.get("dest")
 
-    driver_token_q    = (data.get("driver_token") or "").strip()
-    passenger_token_q = (data.get("passenger_token") or "").strip()
-    customer_token_q  = (data.get("customer_token") or "").strip()
+    driver_token    = (data.get("driver_token") or "").strip()
+    passenger_token = (data.get("passenger_token") or "").strip()
+    customer_token  = (data.get("customer_token") or "").strip()
 
-    merchant_id_q  = (data.get("merchant_id") or "").strip()
-    order_id_q     = (data.get("order_id") or "").strip()
-    driver_id_q    = (data.get("driver_id") or "").strip()
-    recipient_id_q = (data.get("recipient_id") or "").strip()
+    merchant_id  = (data.get("merchant_id") or "").strip()
+    order_id    = (data.get("order_id") or "").strip()
+    driver_id    = (data.get("driver_id") or "").strip()
+    recipient_id = (data.get("recipient_id") or "").strip()
 
     # Embed hints text for numeric coords only
     if origin and dest:

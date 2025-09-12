@@ -3,9 +3,15 @@ synapseFlask/config.json
 synapse-frontend/src/config.js 
 synapseFlask/synapse-54cfb-firebase-adminsdk-fbsvc-6d63c78be8.json
 
+synapseBackendFlask/config.json
+synapseBackendFlask/synapse-54cfb-firebase-adminsdk-fbsvc-6d63c78be8.json
+
 # Flask uploads & evidence (user data, temp files)
 synapseFlask/uploads/
 synapseFlask/evidence/
+
+/uploads/
+/evidence/
 
 # Python artifacts
 __pycache__/
