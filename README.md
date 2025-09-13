@@ -16,7 +16,7 @@ Synapse is a full-stack application showcasing an intelligent AI agent that **au
 
 ## 🏛️ Architecture
 
-<img width="813" height="464" alt="image" src="https://github.com/user-attachments/assets/37f2ba98-510f-4e49-83fb-ee7c95bc6b2f" />
+<img width="1920" height="1080" alt="4gentic-protein-bar_SRMInstituteofScienceAndTechnologyChennai" src="https://github.com/user-attachments/assets/5b3e6f94-86ff-496d-8431-dddeddbb3b99" />
 
 ---
 
